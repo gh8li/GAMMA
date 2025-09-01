@@ -38,7 +38,7 @@ cd ..
 After compilation, the binary file will be in the `build/` directory. You can execute GAMMA* using the following command.
 
 ```shell
-./build/gamma --algorithm <algorithm ID> --query <query-graph-path> --data <data-graph-path>  --update <update-path>
+./build/gamma --query <query-graph-path> --data <data-graph-path>  --update <update-path>
 ```
 
 ### Commandline Parameters
