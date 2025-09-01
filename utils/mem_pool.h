@@ -15,6 +15,7 @@ struct MemPool
     void Alloc(unsigned long long int size)
     {
         cudaErrorCheck(cudaMalloc(&array_, sizeof(T) * size));
+        cudaErrorCheck(cudaMemset(array_, 0u, sizeof(T) * size));  // added by lgh 20/06/2025
         capacity_ = size;
         h_occupy_ = 0ul;
         cudaErrorCheck(cudaMalloc(&occupy_, sizeof(unsigned long long int)));

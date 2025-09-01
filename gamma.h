@@ -30,7 +30,7 @@ void print_matching_results(const uint32_t *result_ptr, const uint32_t result_si
 }
 
 void gammaProcess(const std::string &query_path, const std::string &data_path, const std::string &update_path,
-                  uint32_t batch_size, const bool print_results=false) {
+                  uint32_t batch_size, const bool print_results=false, const bool print_indexing_time=false) {
 
     std::cout << "----------- Read Graphs from Files ------------\n";
 
@@ -89,7 +89,7 @@ void gammaProcess(const std::string &query_path, const std::string &data_path, c
     TIME_START();
     for (uint8_t i = 0u; i < QE_COUNT; i++) {
         // Add edges in csr_gpu into global_index_gpu.
-        match_gpu.UpdateGlobalIndex(data_graph_gpu, global_index_gpu, global_bitmap_gpu, csr_gpu, i);
+        match_gpu.InitiallyUpdateGlobalIndex(data_graph_gpu, global_index_gpu, global_bitmap_gpu, csr_gpu, i);
     }
     TIME_END();
     PRINT_LOCAL_TIME("Build Global Index Offline");
@@ -129,13 +129,23 @@ void gammaProcess(const std::string &query_path, const std::string &data_path, c
     uint32_t **result_ptr_array = new uint32_t*[num_batches];
     uint32_t *result_size_array = new uint32_t[num_batches];
     for (const auto &batch : data_graph.updated_edges_) {
-        std::cout << std::endl;
-        std::cout << "Batch #" << batch_idx << " --------" << std::endl;
-        //  Doubt: Why every time?
+        // std::cout << std::endl;
+        // std::cout << "Batch #" << batch_idx << " --------" << std::endl;
+        // //  Doubt: Why every time?
         match_gpu.SetGraphPtrs(data_graph_gpu);
+
+        cudaEvent_t index_cuda_start;
+        float index_kernel_time;
+        std::chrono::system_clock::time_point index_start_clock;
+        if (print_indexing_time) {
+            index_start_clock = std::chrono::high_resolution_clock::now();
+            cudaEventCreate(&index_cuda_start);
+            cudaEventRecord(index_cuda_start);
+        }
+
         for (uint8_t i = 0u; i < QE_COUNT; i++) {
             // LTIME_START();
-            std::cout << "Query Edge #" + std::to_string(i) << '\n';
+            // std::cout << "Query Edge #" + std::to_string(i) << '\n';
             //  lgh: i is current idx_in_qe_list_
             match_gpu.BuildTries(batch, csr_gpu, i);
             match_gpu.UpdateGlobalIndex(data_graph_gpu, global_index_gpu, global_bitmap_gpu, csr_gpu, i);
@@ -143,13 +153,45 @@ void gammaProcess(const std::string &query_path, const std::string &data_path, c
             // LPRINT_LOCAL_TIME("Finish Query Edge #" + std::to_string(i));
         }
 
+        cudaEvent_t local_cuda_start, local_cuda_end;
+        float local_kernel_time;                                
+        std::chrono::system_clock::time_point local_start_clock;
+        if (print_indexing_time) {
+            local_start_clock = std::chrono::high_resolution_clock::now();
+            cudaEventCreate(&local_cuda_start);
+            cudaEventCreate(&local_cuda_end);
+            cudaEventRecord(local_cuda_start);
+        }
+
         // std::cout << "before build local index" << endl;
         bool local_index_nonempty = false;
         for (uint8_t i = 0u; i < QE_COUNT; i++) {
-            if (match_gpu.GammaBuildLocalIndex(global_index_gpu, global_bitmap_gpu, local_index_base_gpu, local_bitmap_gpu, local_index, 
-                                               csr_gpu, i, avg_degrees)){
+            if (match_gpu.GammaBuildLocalIndex(global_index_gpu, global_bitmap_gpu, local_index_base_gpu, local_bitmap_gpu, local_index,
+                                               csr_gpu, i, avg_degrees)) {
                 local_index_nonempty = true;
             }
+        }
+
+        std::chrono::system_clock::time_point local_end_clock;
+        if (print_indexing_time) {
+            local_end_clock = std::chrono::high_resolution_clock::now();
+            cudaEventRecord(local_cuda_end);
+            cudaEventSynchronize(index_cuda_start);
+            cudaEventSynchronize(local_cuda_start);
+            cudaEventSynchronize(local_cuda_end);
+            cudaEventElapsedTime(&local_kernel_time, local_cuda_start, local_cuda_end);
+            std::chrono::duration<double> local_diff = local_end_clock - local_start_clock;
+            
+            cudaEventElapsedTime(&index_kernel_time, index_cuda_start, local_cuda_end);
+            std::chrono::duration<double> index_diff = local_end_clock - index_start_clock;
+    
+            std::cout << "Finish Index Maintenance" << ", time (ms): " <<             \
+                    static_cast<unsigned long>(index_diff.count() * 1000) <<          \
+                    "(host), " << static_cast<unsigned long>(index_kernel_time) <<    \
+                    "(kernel)" <<", Local Index time (ms): " <<                       \
+                    static_cast<unsigned long>(local_diff.count() * 1000) <<          \
+                    "(host), " << static_cast<unsigned long>(local_kernel_time) <<    \
+                    "(kernel)\n";;
         }
         // std::cout << "before GammaMatching" << endl;
         if (local_index_nonempty) {

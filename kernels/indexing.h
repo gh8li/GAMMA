@@ -31,19 +31,44 @@ __global__ void setNeighborPointers(
     uint32_t **ptr
 );
 
-__global__ void addTriesToGraph(
-    const CSR_GPU csr_gpu,
-    RelationsGPU data,
-    const uint32_t idx,
-    MemPool<uint32_t> nbr_mem_pool
+__global__ void setNeighborIsUpdatePointers(
+    bool *base,
+    const uint32_t *offsets,
+    const uint32_t size,
+    bool **ptr
 );
 
-__global__ void statisticIndex(
-    const RelationsGPU data,
-    const uint32_t idx,
-    uint32_t *sum,
-    uint32_t *count
-);
+// __global__ void setNeighborIsUpdatePointers(
+//     bool *base,
+//     const uint32_t *offsets,
+//     const uint32_t size,
+//     bool **ptr
+// );
+
+__global__ void addTriesToGraph(const CSR_GPU csr_gpu,
+                                RelationsGPU data,
+                                const uint32_t idx,
+                                MemPool<uint32_t> nbr_mem_pool);
+
+__global__ void addTriesToIndex(const CSR_GPU csr_gpu,
+                                RelationsGPU data,
+                                const uint32_t idx,
+                                MemPool<uint32_t> nbr_mem_pool,
+                                MemPool<bool> nbr_is_update_mem_pool,
+                                bool b_is_update);
+
+__global__ void addTriesToIndexWithIsUpdateArray(
+        const CSR_GPU csr_gpu,
+        RelationsGPU data,
+        const uint32_t idx,
+        MemPool<uint32_t> nbr_mem_pool,
+        MemPool<bool> nbr_is_update_mem_pool,
+        bool *b_is_update_array);
+
+__global__ void statisticIndex(const RelationsGPU data,
+                               const uint32_t idx,
+                               uint32_t *sum,
+                               uint32_t *count);
 
 __global__ void getGlobalCandidates(
     const RelationsGPU data,
@@ -73,6 +98,17 @@ __global__ void getGlobalCandidateEdgesWrite(
     uint32_t *relation_u,
     uint32_t *relation_uu
 );
+
+__global__ void getGlobalCandidateEdgesWriteWithIsUpdate(
+        const RelationsGPU data,
+        const uint32_t idx,
+        const uint32_t *new_cand,
+        const uint32_t new_cand_size,
+        const uint32_t *other_cand_bits,
+        uint32_t *cand_e_count_prefix_sum,
+        uint32_t *relation_u,
+        uint32_t *relation_uu,
+        bool *is_update_flags);
 
 __global__ void filterRelevantCount(
     const CSR_GPU input,

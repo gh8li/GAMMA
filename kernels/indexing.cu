@@ -73,12 +73,25 @@ __global__ void setNeighborPointers(
     }
 }
 
-__global__ void addTriesToGraph(
-    const CSR_GPU csr_gpu,
-    RelationsGPU data,
-    const uint32_t idx,
-    MemPool<uint32_t> nbr_mem_pool
+__global__ void setNeighborIsUpdatePointers(
+    bool *base,
+    const uint32_t *offsets,
+    const uint32_t size,
+    bool **ptr
 ) {
+    const uint32_t tid = blockDim.x * blockIdx.x + threadIdx.x;
+    const uint32_t num_threads = blockDim.x * gridDim.x;
+
+    for (int i = tid; i < size; i += num_threads)
+    {
+        ptr[i] = base + offsets[i];
+    }
+}
+
+__global__ void addTriesToGraph(const CSR_GPU csr_gpu,
+                                RelationsGPU data,
+                                const uint32_t idx,
+                                MemPool<uint32_t> nbr_mem_pool) {
     const uint32_t warp_id = threadIdx.x / WARP_SIZE;
     const uint32_t lane_id = threadIdx.x % WARP_SIZE;
     const uint32_t gwarp_id = warp_id + blockDim.x * blockIdx.x / WARP_SIZE;
@@ -262,6 +275,464 @@ __global__ void addTriesToGraph(
     }
 }
 
+__global__ void addTriesToIndex(const CSR_GPU csr_gpu,
+                                RelationsGPU data,
+                                const uint32_t idx,
+                                MemPool<uint32_t> nbr_mem_pool,
+                                MemPool<bool> nbr_is_update_mem_pool,
+                                bool b_is_update) {
+    const uint32_t warp_id = threadIdx.x / WARP_SIZE;
+    const uint32_t lane_id = threadIdx.x % WARP_SIZE;
+    const uint32_t gwarp_id = warp_id + blockDim.x * blockIdx.x / WARP_SIZE;
+    const uint32_t num_warps = blockDim.x * gridDim.x / WARP_SIZE;
+
+    __shared__ uint32_t insert_num[NUM_WARP_PER_BLOCK][WARP_SIZE];
+    __shared__ uint32_t target_pos[NUM_WARP_PER_BLOCK][WARP_SIZE];
+    // Allocate WarpScan shared memory for 4 warps
+    __shared__ typename cub::WarpScan<uint32_t>::TempStorage temp_storage[NUM_WARP_PER_BLOCK];
+
+
+    for (uint32_t i = gwarp_id; i < csr_gpu.vs_size_; i += num_warps) {
+        if (*nbr_mem_pool.occupy_ >= nbr_mem_pool.capacity_ ||
+            *nbr_is_update_mem_pool.occupy_ >= nbr_is_update_mem_pool.capacity_) return;
+
+        const uint32_t& v = csr_gpu.vs_[i];
+
+        // merge data.nbrs_[idx][v] and csr_gpu.nbrs_[csr_gpu.offs_[i]: csr_gpu.offs_[i + 1]]
+        const uint32_t* a = data.nbrs_[idx][v];
+        const bool* a_is_update = data.nbrs_is_update_[idx][v];
+        const uint32_t* b = csr_gpu.nbrs_ + csr_gpu.offs_[i];
+        // Doubt: If c_size < data.capacity_[idx][v], will writing to c[x] spoil the value in a[x]? (Seems not)
+        uint32_t *c = data.nbrs_[idx][v];
+        bool *c_is_update = data.nbrs_is_update_[idx][v];
+        const uint32_t a_size = data.sizes_[idx][v];
+        const uint32_t b_size = csr_gpu.offs_[i + 1] - csr_gpu.offs_[i];
+        const uint32_t c_size = a_size + b_size;
+
+        if (c_size >= data.capacity_[idx][v]) {
+            if (lane_id == 0) {
+                //printf("reallocate %d %d ", idx, v);
+                unsigned long long int new_capacity = max((size_t)exp2(ceilf(log2f(c_size) + 1)), 8ul);
+                // (Solved) Doubt: Why the old value of nbr_mem_pool.occupy_ is new_array_start?
+                // new_array_start is in fact the new_array_start_offset.
+                unsigned long long int new_array_start = atomicAdd(nbr_mem_pool.occupy_, new_capacity);
+                unsigned long long int new_is_update_array_start = atomicAdd(nbr_is_update_mem_pool.occupy_, new_capacity);
+
+                if (new_array_start + new_capacity < nbr_mem_pool.capacity_ &&
+                    new_is_update_array_start + new_capacity < nbr_is_update_mem_pool.capacity_) {
+                    c = data.nbrs_[idx][v] = nbr_mem_pool.array_ + new_array_start;
+                    c_is_update = data.nbrs_is_update_[idx][v] = nbr_is_update_mem_pool.array_ + new_is_update_array_start;
+                    data.capacity_[idx][v] = new_capacity;
+                }
+                else {
+                    printf("out of memory!\n");
+                }
+            }
+            c = (uint32_t*)__shfl_sync(0xffffffff, (unsigned long)c, 0, 64);
+            c_is_update = (bool*)__shfl_sync(0xffffffff, (unsigned long)c_is_update, 0, 64);
+        }
+        __syncwarp();
+        if (*nbr_mem_pool.occupy_ >= nbr_mem_pool.capacity_ || 
+            *nbr_is_update_mem_pool.occupy_ >= nbr_is_update_mem_pool.capacity_) return;
+
+        data.sizes_[idx][v] = c_size;
+
+        uint32_t a_start = a_size - 1, a_end;
+        uint32_t b_start = b_size - 1, b_end;
+        uint32_t c_start = c_size - 1;
+
+        // Doubt: Does a_start < a_size mean a_start >= 0 ? Same for b_start. (a_start has been assigned with a_size -1)
+        while (a_start < a_size || b_start < b_size) {
+
+            if (*nbr_mem_pool.occupy_ >= nbr_mem_pool.capacity_ || 
+                *nbr_is_update_mem_pool.occupy_ >= nbr_is_update_mem_pool.capacity_) return;
+
+            if (a_start >= a_size) {
+                // write the remaining b to c
+                // Doubt: Seems that usint32_t j will overflow (smaller than 0). Does j < b_size mean j >= 0 ?
+                for (uint32_t j = b_start - lane_id; j < b_size; j -= WARP_SIZE) {
+                    c[j] = b[j];
+                    if (b_is_update) {
+                        c_is_update[j] = true;
+                    } else {
+                        c_is_update[j] = false;
+                    }
+                }
+                b_start = UINT32_MAX;
+                continue;
+            }
+            if (b_start >= b_size) {
+                // write the remaining a to c
+                for (uint32_t j = a_start - lane_id; j < a_size; j -= WARP_SIZE) {
+                    c[j] = a[j];
+                    c_is_update[j] = a_is_update[j];
+                    // if (is_initial) {
+                    //     c_is_update[j] = false;
+                    // } else {
+                    //     c_is_update[j] = a_is_update[j];
+                    // }
+                    // c_is_update[j] = false;
+                }
+                a_start = UINT32_MAX;
+                continue;
+            }
+            insert_num[warp_id][lane_id] = 0u;
+            target_pos[warp_id][lane_id] = 0u;
+
+            // include both start and end
+            // at first loop, a_end == a_size - WAPR_SIZE or 0, b_end = b_size - WARP_SIZE or 0
+            a_end = a_start + 1 - WARP_SIZE < a_size ? a_start + 1 - WARP_SIZE : 0;
+            b_end = b_start + 1 - WARP_SIZE < b_size ? b_start + 1 - WARP_SIZE : 0;
+            //if (lane_id == 0) printf("a_start=%d, a_end=%d, b_start=%d, b_end=%d, c_start=%d\n", a_start, a_end, b_start, b_end, c_start);
+
+            // (Solved) Doubt: Why compare two vertex IDs? Answer: result array should be sorted by vertex IDs.
+            if (a[a_end] < b[b_end]) {
+                // write the entire b[b_start:b_end] and part of a[a_start:a_end] to c
+                //if (lane_id == 0) printf("case 3a\n");
+                // at first loop, b_start - b_end == WARP_SIZE - 1 or b_start
+                if (lane_id <= b_start - b_end) {
+                    // at first loop, a_start + 1 - a_end == WARP_SIZE or a_size (smaller one)
+                    // insert_pos range: [0, WARP_SIZE or a_size (smaller one)]
+                    uint32_t insert_pos = lower_bound(a + a_end, a_start + 1 - a_end, b[b_start - lane_id]);
+                    // insert_pos range: [0, WARP_SIZE or a_size (smaller one)], insert_pos is reversed.
+                    insert_pos = a_start + 1 - a_end - insert_pos;
+                    //printf("find %d at %d\n", b[b_start - lane_id], insert_pos);
+                    atomicAdd(&insert_num[warp_id][insert_pos], 1u);
+                    target_pos[warp_id][lane_id] = insert_pos;
+                }
+                __syncwarp();
+                // insert_num[warp_id] <- exclusive_sum(insert_num[warp_id])
+                cub::WarpScan<uint32_t>(temp_storage[warp_id]).ExclusiveSum(insert_num[warp_id][lane_id], insert_num[warp_id][lane_id]);
+                //if (lane_id == 0) printf("insert_num ");
+                //printf("%d ", insert_num[warp_id][lane_id]);
+                //if (lane_id == 0) printf("target_pos ");
+                //printf("%d ", target_pos[warp_id][lane_id]);
+
+                bool write_a = true;
+                if (lane_id <= a_start - a_end && a[a_start - lane_id] > b[b_end]) {
+                    //printf("write a c[%d]=%d\n", c_start - insert_num[warp_id][lane_id + 1] - lane_id, a[a_start - lane_id]);
+                    write_a = false;
+                    // at first loop, if lane_id + 1 == WARP_SIZE (largest possible lane_id), a[a_start - lane_id] > b[b_end] will not pass
+                    // because a_start - lane_id == a_end, and a[a_end] < b[b_end] according to the condition of outer if block.
+                    // Thus, `insert_num[warp_id][lane_id + 1] - lane_id]` is safe.
+                    uint32_t c_pos = c_start - insert_num[warp_id][lane_id + 1] - lane_id;
+                    c[c_pos] = a[a_start - lane_id];
+                    c_is_update[c_pos] = a_is_update[a_start - lane_id];
+                    // if (is_initial) {
+                    //     c_is_update[c_pos] = false;
+                    // } else {
+                    //     c_is_update[c_pos] = a_is_update[a_start - lane_id];
+                    // }
+                    // c_is_update[c_pos] = a_is_update[a_start - lane_id];
+                    // c_is_update[c_pos] = false;
+                }
+                __syncwarp();
+                if (lane_id <= b_start - b_end) {
+                    //printf("write b c[%d]=%d\n", c_start - target_pos[warp_id][lane_id] - lane_id, b[b_start - lane_id]);
+                    uint32_t c_pos = c_start - target_pos[warp_id][lane_id] - lane_id;
+                    c[c_pos] = b[b_start - lane_id];
+                    if (b_is_update) {
+                        c_is_update[c_pos] = true;
+                    } else {
+                        c_is_update[c_pos] = false;
+                    }
+                    // c_is_update[c_pos] = true;
+                }
+                c_start = c_start - b_start + b_end - 1;
+                b_start = b_end - 1;
+                int next_first = __ffs(__ballot_sync(0xffffffff, write_a));
+                //if (lane_id == 0) printf("next_first=%d \n", next_first);
+                __syncwarp();
+                c_start = c_start - next_first + 1;
+                a_start = a_start - next_first + 1;
+            }
+            else {
+                // write the entire a[a_start:a_end] and part of b[b_start:b_end] to c
+                //if (lane_id == 0) printf("case 3b\n");
+                if (lane_id <= a_start - a_end) {
+                    uint32_t insert_pos = lower_bound(b + b_end, b_start + 1 - b_end, a[a_start - lane_id]);
+                    insert_pos = b_start + 1 - b_end - insert_pos;
+                    //printf("find %d at %d\n", a[a_start - lane_id], insert_pos);
+                    atomicAdd(&insert_num[warp_id][insert_pos], 1u);
+                    target_pos[warp_id][lane_id] = insert_pos;
+                }
+                __syncwarp();
+                cub::WarpScan<uint32_t>(temp_storage[warp_id]).ExclusiveSum(insert_num[warp_id][lane_id], insert_num[warp_id][lane_id]);
+                //if (lane_id == 0) printf("insert_num ");
+                //printf("%d ", insert_num[warp_id][lane_id]);
+                //if (lane_id == 0) printf("target_pos ");
+                //printf("%d ", target_pos[warp_id][lane_id]);
+
+                if (lane_id <= a_start - a_end) {
+                    //printf("write a c[%d]=%d\n", c_start - target_pos[warp_id][lane_id] - lane_id, a[a_start - lane_id]);
+                    uint32_t c_pos = c_start - target_pos[warp_id][lane_id] - lane_id;
+                    c[c_pos] = a[a_start - lane_id];
+                    c_is_update[c_pos] = a_is_update[a_start - lane_id];
+                    // if (is_initial) {
+                    //     c_is_update[c_pos] = false;
+                    // } else {
+                    //     c_is_update[c_pos] = a_is_update[a_start - lane_id];
+                    // }
+                    // c_is_update[c_pos] = a_is_update[a_start - lane_id];
+                    // c_is_update[c_pos] = false;
+                }
+                __syncwarp();
+                bool write_a = true;
+                if (lane_id <= b_start - b_end && b[b_start - lane_id] > a[a_end]) {
+                    //printf("write b c[%d]=%d\n", c_start - insert_num[warp_id][lane_id + 1] - lane_id, b[b_start - lane_id]);
+                    write_a = false;
+                    uint32_t c_pos = c_start - insert_num[warp_id][lane_id + 1] - lane_id;
+                    c[c_pos] = b[b_start - lane_id];
+                    if (b_is_update) {
+                        c_is_update[c_pos] = true;
+                    } else {
+                        c_is_update[c_pos] = false;
+                    }
+                    // c_is_update[c_pos] = true;
+                }
+                c_start = c_start - a_start + a_end - 1;
+                a_start = a_end - 1;
+                int next_first = __ffs(__ballot_sync(0xffffffff, write_a));
+                //if (lane_id == 0) printf("nxt_first=%d \n", next_first);
+                __syncwarp();
+                c_start = c_start - next_first + 1;
+                b_start = b_start - next_first + 1;
+            }
+        }
+    }
+}
+
+__global__ void addTriesToIndexWithIsUpdateArray(
+        const CSR_GPU csr_gpu,
+        RelationsGPU data,
+        const uint32_t idx,
+        MemPool<uint32_t> nbr_mem_pool,
+        MemPool<bool> nbr_is_update_mem_pool,
+        bool *b_is_update_array) {
+    const uint32_t warp_id = threadIdx.x / WARP_SIZE;
+    const uint32_t lane_id = threadIdx.x % WARP_SIZE;
+    const uint32_t gwarp_id = warp_id + blockDim.x * blockIdx.x / WARP_SIZE;
+    const uint32_t num_warps = blockDim.x * gridDim.x / WARP_SIZE;
+
+    __shared__ uint32_t insert_num[NUM_WARP_PER_BLOCK][WARP_SIZE];
+    __shared__ uint32_t target_pos[NUM_WARP_PER_BLOCK][WARP_SIZE];
+    // Allocate WarpScan shared memory for 4 warps
+    __shared__ typename cub::WarpScan<uint32_t>::TempStorage temp_storage[NUM_WARP_PER_BLOCK];
+
+    for (uint32_t i = gwarp_id; i < csr_gpu.vs_size_; i += num_warps) {
+        if (*nbr_mem_pool.occupy_ >= nbr_mem_pool.capacity_ ||
+            *nbr_is_update_mem_pool.occupy_ >= nbr_is_update_mem_pool.capacity_) return;
+
+        const uint32_t& v = csr_gpu.vs_[i];
+
+        // merge data.nbrs_[idx][v] and csr_gpu.nbrs_[csr_gpu.offs_[i]: csr_gpu.offs_[i + 1]]
+        const uint32_t* a = data.nbrs_[idx][v];
+        const bool* a_is_update = data.nbrs_is_update_[idx][v];
+        const uint32_t* b = csr_gpu.nbrs_ + csr_gpu.offs_[i];
+        const bool* b_is_update = b_is_update_array + csr_gpu.offs_[i];
+        // Doubt: If c_size < data.capacity_[idx][v], will writing to c[x] spoil the value in a[x]? (Seems not)
+        uint32_t *c = data.nbrs_[idx][v];
+        bool *c_is_update = data.nbrs_is_update_[idx][v];
+        const uint32_t a_size = data.sizes_[idx][v];
+        const uint32_t b_size = csr_gpu.offs_[i + 1] - csr_gpu.offs_[i];
+        const uint32_t c_size = a_size + b_size;
+
+        if (c_size >= data.capacity_[idx][v]) {
+            if (lane_id == 0) {
+                //printf("reallocate %d %d ", idx, v);
+                unsigned long long int new_capacity = max((size_t)exp2(ceilf(log2f(c_size) + 1)), 8ul);
+                // (Solved) Doubt: Why the old value of nbr_mem_pool.occupy_ is new_array_start?
+                // new_array_start is in fact the new_array_start_offset.
+                unsigned long long int new_array_start = atomicAdd(nbr_mem_pool.occupy_, new_capacity);
+                unsigned long long int new_is_update_array_start = atomicAdd(nbr_is_update_mem_pool.occupy_, new_capacity);
+
+                if (new_array_start + new_capacity < nbr_mem_pool.capacity_ &&
+                    new_is_update_array_start + new_capacity < nbr_is_update_mem_pool.capacity_) {
+                    c = data.nbrs_[idx][v] = nbr_mem_pool.array_ + new_array_start;
+                    c_is_update = data.nbrs_is_update_[idx][v] = nbr_is_update_mem_pool.array_ + new_is_update_array_start;
+                    data.capacity_[idx][v] = new_capacity;
+                }
+                else {
+                    printf("out of memory!\n");
+                }
+            }
+            c = (uint32_t*)__shfl_sync(0xffffffff, (unsigned long)c, 0, 64);
+            c_is_update = (bool*)__shfl_sync(0xffffffff, (unsigned long)c_is_update, 0, 64);
+        }
+        __syncwarp();
+        if (*nbr_mem_pool.occupy_ >= nbr_mem_pool.capacity_ || 
+            *nbr_is_update_mem_pool.occupy_ >= nbr_is_update_mem_pool.capacity_) return;
+
+        data.sizes_[idx][v] = c_size;
+
+        uint32_t a_start = a_size - 1, a_end;
+        uint32_t b_start = b_size - 1, b_end;
+        uint32_t c_start = c_size - 1;
+
+        // Doubt: Does a_start < a_size mean a_start >= 0 ? Same for b_start. (a_start has been assigned with a_size -1)
+        while (a_start < a_size || b_start < b_size) {
+
+            if (*nbr_mem_pool.occupy_ >= nbr_mem_pool.capacity_ || 
+                *nbr_is_update_mem_pool.occupy_ >= nbr_is_update_mem_pool.capacity_) return;
+
+            if (a_start >= a_size) {
+                // write the remaining b to c
+                // Doubt: Seems that usint32_t j will overflow (smaller than 0). Does j < b_size mean j >= 0 ?
+                for (uint32_t j = b_start - lane_id; j < b_size; j -= WARP_SIZE) {
+                    c[j] = b[j];
+                    c_is_update[j] = b_is_update[j];
+                    // if (b_is_update) {
+                    //     c_is_update[j] = true;
+                    // } else {
+                    //     c_is_update[j] = false;
+                    // }
+                }
+                b_start = UINT32_MAX;
+                continue;
+            }
+            if (b_start >= b_size) {
+                // write the remaining a to c
+                for (uint32_t j = a_start - lane_id; j < a_size; j -= WARP_SIZE) {
+                    c[j] = a[j];
+                    c_is_update[j] = a_is_update[j];
+                    // if (is_initial) {
+                    //     c_is_update[j] = false;
+                    // } else {
+                    //     c_is_update[j] = a_is_update[j];
+                    // }
+                    // c_is_update[j] = false;
+                }
+                a_start = UINT32_MAX;
+                continue;
+            }
+            insert_num[warp_id][lane_id] = 0u;
+            target_pos[warp_id][lane_id] = 0u;
+
+            // include both start and end
+            // at first loop, a_end == a_size - WAPR_SIZE or 0, b_end = b_size - WARP_SIZE or 0
+            a_end = a_start + 1 - WARP_SIZE < a_size ? a_start + 1 - WARP_SIZE : 0;
+            b_end = b_start + 1 - WARP_SIZE < b_size ? b_start + 1 - WARP_SIZE : 0;
+            //if (lane_id == 0) printf("a_start=%d, a_end=%d, b_start=%d, b_end=%d, c_start=%d\n", a_start, a_end, b_start, b_end, c_start);
+
+            // (Solved) Doubt: Why compare two vertex IDs? Answer: result array should be sorted by vertex IDs.
+            if (a[a_end] < b[b_end]) {
+                // write the entire b[b_start:b_end] and part of a[a_start:a_end] to c
+                //if (lane_id == 0) printf("case 3a\n");
+                // at first loop, b_start - b_end == WARP_SIZE - 1 or b_start
+                if (lane_id <= b_start - b_end) {
+                    // at first loop, a_start + 1 - a_end == WARP_SIZE or a_size (smaller one)
+                    // insert_pos range: [0, WARP_SIZE or a_size (smaller one)]
+                    uint32_t insert_pos = lower_bound(a + a_end, a_start + 1 - a_end, b[b_start - lane_id]);
+                    // insert_pos range: [0, WARP_SIZE or a_size (smaller one)], insert_pos is reversed.
+                    insert_pos = a_start + 1 - a_end - insert_pos;
+                    //printf("find %d at %d\n", b[b_start - lane_id], insert_pos);
+                    atomicAdd(&insert_num[warp_id][insert_pos], 1u);
+                    target_pos[warp_id][lane_id] = insert_pos;
+                }
+                __syncwarp();
+                // insert_num[warp_id] <- exclusive_sum(insert_num[warp_id])
+                cub::WarpScan<uint32_t>(temp_storage[warp_id]).ExclusiveSum(insert_num[warp_id][lane_id], insert_num[warp_id][lane_id]);
+                //if (lane_id == 0) printf("insert_num ");
+                //printf("%d ", insert_num[warp_id][lane_id]);
+                //if (lane_id == 0) printf("target_pos ");
+                //printf("%d ", target_pos[warp_id][lane_id]);
+
+                bool write_a = true;
+                if (lane_id <= a_start - a_end && a[a_start - lane_id] > b[b_end]) {
+                    //printf("write a c[%d]=%d\n", c_start - insert_num[warp_id][lane_id + 1] - lane_id, a[a_start - lane_id]);
+                    write_a = false;
+                    // at first loop, if lane_id + 1 == WARP_SIZE (largest possible lane_id), a[a_start - lane_id] > b[b_end] will not pass
+                    // because a_start - lane_id == a_end, and a[a_end] < b[b_end] according to the condition of outer if block.
+                    // Thus, `insert_num[warp_id][lane_id + 1] - lane_id]` is safe.
+                    uint32_t c_pos = c_start - insert_num[warp_id][lane_id + 1] - lane_id;
+                    c[c_pos] = a[a_start - lane_id];
+                    c_is_update[c_pos] = a_is_update[a_start - lane_id];
+                    // if (is_initial) {
+                    //     c_is_update[c_pos] = false;
+                    // } else {
+                    //     c_is_update[c_pos] = a_is_update[a_start - lane_id];
+                    // }
+                    // c_is_update[c_pos] = a_is_update[a_start - lane_id];
+                    // c_is_update[c_pos] = false;
+                }
+                __syncwarp();
+                if (lane_id <= b_start - b_end) {
+                    //printf("write b c[%d]=%d\n", c_start - target_pos[warp_id][lane_id] - lane_id, b[b_start - lane_id]);
+                    uint32_t c_pos = c_start - target_pos[warp_id][lane_id] - lane_id;
+                    c[c_pos] = b[b_start - lane_id];
+                    c_is_update[c_pos] = b_is_update[b_start - lane_id];
+                    // if (b_is_update) {
+                    //     c_is_update[c_pos] = true;
+                    // } else {
+                    //     c_is_update[c_pos] = false;
+                    // }
+                    // c_is_update[c_pos] = true;
+                }
+                c_start = c_start - b_start + b_end - 1;
+                b_start = b_end - 1;
+                int next_first = __ffs(__ballot_sync(0xffffffff, write_a));
+                //if (lane_id == 0) printf("next_first=%d \n", next_first);
+                __syncwarp();
+                c_start = c_start - next_first + 1;
+                a_start = a_start - next_first + 1;
+            }
+            else {
+                // write the entire a[a_start:a_end] and part of b[b_start:b_end] to c
+                //if (lane_id == 0) printf("case 3b\n");
+                if (lane_id <= a_start - a_end) {
+                    uint32_t insert_pos = lower_bound(b + b_end, b_start + 1 - b_end, a[a_start - lane_id]);
+                    insert_pos = b_start + 1 - b_end - insert_pos;
+                    //printf("find %d at %d\n", a[a_start - lane_id], insert_pos);
+                    atomicAdd(&insert_num[warp_id][insert_pos], 1u);
+                    target_pos[warp_id][lane_id] = insert_pos;
+                }
+                __syncwarp();
+                cub::WarpScan<uint32_t>(temp_storage[warp_id]).ExclusiveSum(insert_num[warp_id][lane_id], insert_num[warp_id][lane_id]);
+                //if (lane_id == 0) printf("insert_num ");
+                //printf("%d ", insert_num[warp_id][lane_id]);
+                //if (lane_id == 0) printf("target_pos ");
+                //printf("%d ", target_pos[warp_id][lane_id]);
+
+                if (lane_id <= a_start - a_end) {
+                    //printf("write a c[%d]=%d\n", c_start - target_pos[warp_id][lane_id] - lane_id, a[a_start - lane_id]);
+                    uint32_t c_pos = c_start - target_pos[warp_id][lane_id] - lane_id;
+                    c[c_pos] = a[a_start - lane_id];
+                    c_is_update[c_pos] = a_is_update[a_start - lane_id];
+                    // if (is_initial) {
+                    //     c_is_update[c_pos] = false;
+                    // } else {
+                    //     c_is_update[c_pos] = a_is_update[a_start - lane_id];
+                    // }
+                    // c_is_update[c_pos] = a_is_update[a_start - lane_id];
+                    // c_is_update[c_pos] = false;
+                }
+                __syncwarp();
+                bool write_a = true;
+                if (lane_id <= b_start - b_end && b[b_start - lane_id] > a[a_end]) {
+                    //printf("write b c[%d]=%d\n", c_start - insert_num[warp_id][lane_id + 1] - lane_id, b[b_start - lane_id]);
+                    write_a = false;
+                    uint32_t c_pos = c_start - insert_num[warp_id][lane_id + 1] - lane_id;
+                    c[c_pos] = b[b_start - lane_id];
+                    c_is_update[c_pos] = b_is_update[b_start - lane_id];
+                    // if (b_is_update) {
+                    //     c_is_update[c_pos] = true;
+                    // } else {
+                    //     c_is_update[c_pos] = false;
+                    // }
+                    // c_is_update[c_pos] = true;
+                }
+                c_start = c_start - a_start + a_end - 1;
+                a_start = a_end - 1;
+                int next_first = __ffs(__ballot_sync(0xffffffff, write_a));
+                //if (lane_id == 0) printf("nxt_first=%d \n", next_first);
+                __syncwarp();
+                c_start = c_start - next_first + 1;
+                b_start = b_start - next_first + 1;
+            }
+        }
+    }
+}
+
 __global__ void statisticIndex(
     const RelationsGPU global_index,
     const uint32_t idx,
@@ -300,36 +771,30 @@ __global__ void statisticIndex(
     }*/
 }
 
-__global__ void getGlobalCandidates(
-    const RelationsGPU data,
-    const uint32_t idx, // current edge_idx
-    const CSR_GPU csr_gpu, // CSR representation of data graph edges that has the same (src_label, edge_label, dst_label) with the query graph edge of current edge_idx
-    uint32_t *cand_bits,
-    bool *cand_flag,
-    const uint32_t u // source vertex of current edge_idx
-) {
+__global__ void getGlobalCandidates(const RelationsGPU data,
+                                    const uint32_t idx, // current edge_idx
+                                    const CSR_GPU csr_gpu, // CSR representation of data graph edges that has the same (src_label, edge_label, dst_label) with the query graph edge of current edge_idx
+                                    uint32_t *cand_bits,
+                                    bool *cand_flag,
+                                    const uint32_t u) {  // source vertex of current edge_idx
     uint32_t tid = blockDim.x * blockIdx.x + threadIdx.x;
     uint32_t num_threads = blockDim.x * gridDim.x;
 
-    for (uint32_t i = tid; i < csr_gpu.vs_size_; i += num_threads)
-    {
+    for (uint32_t i = tid; i < csr_gpu.vs_size_; i += num_threads) {
         uint32_t& dv = csr_gpu.vs_[i];
         bool pass = true;
         // Apply NLF not only to current edge_idx, but also all edges of u
-        for (uint32_t j = C_QV_OFFS[u]; j < C_QV_OFFS[u + 1]; j++)
-        {
+        for (uint32_t j = C_QV_OFFS[u]; j < C_QV_OFFS[u + 1]; j++) {
             // Doubt (solved): (1) Why + csr_gpu.offs_[i + 1] - csr_gpu.offs_[i]? Seems it is redundant. 
             // Answer: `data` contains initail edges and `csr_gpu` contains updated edges.
             // Doubt: (2) Seems all values of sizes_[x][x] are zero. (When invoked at the inital steps.)
             // When invoked at each update batch, this is OK.
-            if ((j == idx ? data.sizes_[j][dv] + csr_gpu.offs_[i + 1] - csr_gpu.offs_[i] : data.sizes_[j][dv]) < C_NLF[j])
-            {
+            if ((j == idx ? data.sizes_[j][dv] + csr_gpu.offs_[i + 1] - csr_gpu.offs_[i] : data.sizes_[j][dv]) < C_NLF[j]) {
                 pass = false;
                 break;
             }
         }
-        if (pass && ((cand_bits[dv / 32] & (1u << (dv % 32))) == 0))
-        {
+        if (pass && ((cand_bits[dv / 32] & (1u << (dv % 32))) == 0)) {
             atomicOr(&cand_bits[dv / 32], 1u << (dv % 32));
             cand_flag[i] = true;
         }
@@ -337,14 +802,12 @@ __global__ void getGlobalCandidates(
     }
 }
 
-__global__ void getGlobalCandidateEdgesCount(
-    const RelationsGPU data,
-    const uint32_t idx,
-    const uint32_t *new_cand,
-    const uint32_t new_cand_size,
-    const uint32_t *other_cand_bits,
-    uint32_t *cand_e_count
-) {
+__global__ void getGlobalCandidateEdgesCount(const RelationsGPU data,
+                                             const uint32_t idx,
+                                             const uint32_t *new_cand,
+                                             const uint32_t new_cand_size,
+                                             const uint32_t *other_cand_bits,
+                                             uint32_t *cand_e_count) {
     __shared__ uint32_t temp_num[NUM_WARP_PER_BLOCK];
 
     uint32_t warp_id = threadIdx.x / WARP_SIZE;
@@ -352,8 +815,7 @@ __global__ void getGlobalCandidateEdgesCount(
     uint32_t gwarp_id = warp_id + blockDim.x * blockIdx.x / WARP_SIZE;
     uint32_t num_warps = blockDim.x * gridDim.x / WARP_SIZE;
 
-    for (uint32_t i = gwarp_id; i < new_cand_size; i += num_warps)
-    {
+    for (uint32_t i = gwarp_id; i < new_cand_size; i += num_warps) {
         const uint32_t v = new_cand[i];
         if (lane_id == 0) temp_num[warp_id] = 0u;
         __syncwarp();
@@ -366,16 +828,13 @@ __global__ void getGlobalCandidateEdgesCount(
                 atomicAdd(&temp_num[warp_id], 1u);
             }
         }*/
-        for (uint32_t j = 0; j < DIV_CEIL(data.sizes_[idx][v], WARP_SIZE); j++)
-        {
+        for (uint32_t j = 0; j < DIV_CEIL(data.sizes_[idx][v], WARP_SIZE); j++) {
             const uint32_t jj = j * WARP_SIZE + lane_id;
             const uint32_t warp_sum = __popc(__ballot_sync(
                 0xffffffff, 
                 jj < data.sizes_[idx][v] &&
-                (other_cand_bits[data.nbrs_[idx][v][jj] / 32] & (1 << (data.nbrs_[idx][v][jj] % 32))) > 0
-            ));
-            if (lane_id == 0u)
-            {
+                (other_cand_bits[data.nbrs_[idx][v][jj] / 32] & (1 << (data.nbrs_[idx][v][jj] % 32))) > 0));
+            if (lane_id == 0u) {
                 atomicAdd(&temp_num[warp_id], warp_sum);
             }
             __syncwarp();
@@ -386,16 +845,14 @@ __global__ void getGlobalCandidateEdgesCount(
     }
 }
 
-__global__ void getGlobalCandidateEdgesWrite(
-    const RelationsGPU data,
-    const uint32_t idx,
-    const uint32_t *new_cand,
-    const uint32_t new_cand_size,
-    const uint32_t *other_cand_bits,
-    uint32_t *cand_e_count_prefix_sum,
-    uint32_t *relation_u,
-    uint32_t *relation_uu
-) {
+__global__ void getGlobalCandidateEdgesWrite(const RelationsGPU data,
+                                             const uint32_t idx,
+                                             const uint32_t *new_cand,
+                                             const uint32_t new_cand_size,
+                                             const uint32_t *other_cand_bits,
+                                             uint32_t *cand_e_count_prefix_sum,
+                                             uint32_t *relation_u,
+                                             uint32_t *relation_uu) {
     __shared__ uint32_t write_pos[NUM_WARP_PER_BLOCK];
 
     uint32_t warp_id = threadIdx.x / WARP_SIZE;
@@ -429,6 +886,63 @@ __global__ void getGlobalCandidateEdgesWrite(
                 relation_uu[cand_e_count_prefix_sum[i] + write_pos[warp_id] + rank] = nbr;
                 if (rank == 0)
                 {
+                    write_pos[warp_id] += __popc(found_mask);
+                }
+            }
+            __syncwarp();
+        }
+        __syncwarp();
+    }
+}
+
+__global__ void getGlobalCandidateEdgesWriteWithIsUpdate(
+        const RelationsGPU data,
+        const uint32_t idx,
+        const uint32_t *new_cand,
+        const uint32_t new_cand_size,
+        const uint32_t *other_cand_bits,
+        uint32_t *cand_e_count_prefix_sum,
+        uint32_t *relation_u,
+        uint32_t *relation_uu,
+        bool *is_update_flags) {
+    __shared__ uint32_t write_pos[NUM_WARP_PER_BLOCK];
+
+    uint32_t warp_id = threadIdx.x / WARP_SIZE;
+    uint32_t lane_id = threadIdx.x % WARP_SIZE;
+    uint32_t gwarp_id = warp_id + blockDim.x * blockIdx.x / WARP_SIZE;
+    uint32_t num_warps = blockDim.x * gridDim.x / WARP_SIZE;
+
+    for (uint32_t i = gwarp_id; i < new_cand_size; i += num_warps) {
+        const uint32_t& v = new_cand[i];
+        uint32_t nbr = UINT32_MAX;
+        bool nbr_is_update = false;
+        if (lane_id == 0) write_pos[warp_id] = 0u;
+        __syncwarp();
+
+        for (uint32_t j = 0; j < DIV_CEIL(data.sizes_[idx][v], WARP_SIZE); j++) {
+            bool found = false;
+            uint32_t nbr_idx = j * WARP_SIZE + lane_id;
+            if (nbr_idx < data.sizes_[idx][v]) {
+                nbr = data.nbrs_[idx][v][nbr_idx];
+                if (data.nbrs_is_update_[idx][v] == NULL) {
+                    printf("Error: nbrs_is_update_[%d][%d] is null!\n", idx, v);
+                }
+                if (nbr_idx >= data.sizes_[idx][v]) {
+                    printf("Error: nbrs_[%d][%d][%d] is out of bounds!\n", idx, v, nbr_idx);
+                }
+                nbr_is_update = data.nbrs_is_update_[idx][v][nbr_idx];
+                if ((other_cand_bits[nbr / 32] & (1 << (nbr % 32))) > 0) {
+                    found = true;
+                }
+            }
+            const uint32_t found_mask = __ballot_sync(0xffffffff, found);
+            if (found) {
+                const uint32_t rank = lane_id == 0 ? 0 : __popc((UINT32_MAX >> (WARP_SIZE - lane_id)) & found_mask);
+                uint32_t cur_output_write_pos = cand_e_count_prefix_sum[i] + write_pos[warp_id] + rank;
+                relation_u[cur_output_write_pos] = v;
+                relation_uu[cur_output_write_pos] = nbr;
+                is_update_flags[cur_output_write_pos] = nbr_is_update;
+                if (rank == 0) {
                     write_pos[warp_id] += __popc(found_mask);
                 }
             }

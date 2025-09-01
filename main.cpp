@@ -54,12 +54,13 @@ int main(int argc, char *argv[]) {
     const int32_t input_device_id = cmd_parser.get_int32_cmd_option("--device", /*default_value=*/0);
     const uint32_t input_batch_size = cmd_parser.get_uint32_cmd_option("--batch_size", /*default_value=*/UINT32_MAX);
     const bool print_results = cmd_parser.get_bool_cmd_option("--print_results", /*default_value=*/false);
+    const bool print_indexing_time = cmd_parser.get_bool_cmd_option("--print_indexing_time", /*default_value=*/false);
 
     cudaSetDevice(input_device_id);
 
     PrintGammaInfo(input_query_path, input_data_path, input_update_path, input_device_id, input_batch_size, print_results);
 
-    gammaProcess(input_query_path, input_data_path, input_update_path, input_batch_size, print_results);
+    gammaProcess(input_query_path, input_data_path, input_update_path, input_batch_size, print_results, print_indexing_time);
 
     return 0;
 }

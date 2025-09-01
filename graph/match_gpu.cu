@@ -4,7 +4,6 @@
 
 #include "graph/graph.h"
 #include "graph/match_gpu.h"
-#include "kernels/cartesian_product.h"
 #include "kernels/gamma_enumeration.h"
 #include "kernels/indexing.h"
 #include "utils/config.h"
@@ -30,6 +29,24 @@ __global__ void AccessdCandCount(uint32_t *d_new_cand_count[]) {
     printf("d_new_cand_count_[0]: %d\n", uint2);
 }
 
+__global__ void WriteRangeArray(uint32_t range_size, uint32_t *range_array) {
+    uint32_t num_threads = blockDim.x * gridDim.x;
+    uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    for (uint32_t i = thread_idx; i < range_size; i+= num_threads) {
+        range_array[i] = i;
+    }
+}
+
+template<typename T>
+__global__ void GatherValues(T *input_array, uint32_t *index_array, 
+                             uint32_t input_size, T *output_array) {
+    uint32_t num_threads = blockDim.x * gridDim.x;
+    uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    for (uint32_t i = thread_idx; i < input_size; i += num_threads) {
+        output_array[i] = input_array[index_array[i]];
+    }
+}
+
 RelationsGPUAllVersions::RelationsGPUAllVersions() : array_data_graphs_() {}
 
 CandidatesGPUAllVersions::CandidatesGPUAllVersions(): array_candidates_gpu_() {}
@@ -38,44 +55,52 @@ CandidatesGPU::CandidatesGPU()
 : candidate_bits_()
 {}
 
-MatchGPU::MatchGPU(
-    const GraphFileIoManager& graph_file_io, 
-    const QueryGraph& query,
-    const PlanManager& plan)
-: query_(query)
-, plan_(plan)
-, data_graph_all_nbrs_{NULL}
-, index_all_nbrs_{NULL}
+MatchGPU::MatchGPU(const GraphFileIoManager& graph_file_io, 
+                   const QueryGraph& query,
+                   const PlanManager& plan): 
+        query_(query),
+        plan_(plan),
+        data_graph_all_nbrs_{NULL},
+        data_graph_all_nbrs_is_update_{NULL},
+        index_all_nbrs_{NULL},
+        index_all_nbrs_is_update_{NULL},
 
-, d_temp_storage_(NULL)
-, temp_storage_bytes_(0ul)
-, temp_storage_capacity_(0ul)
-, cand_flag_(NULL)
-, cand_flag_capacity_(0u)
-, d_new_cand_count_{NULL, NULL}
-, temp_tries_()
-, temp_tries_capacity_{{0u,0u,0u}, {0u,0u,0u}}
-, helper_relation_{NULL, NULL}
-, helper_relation_capacity_{0u}
-, local_nbr_()
-, local_nbr_capacity_{0u}
-, cum_bn_()
+        d_temp_storage_(NULL),
+        temp_storage_bytes_(0ul),
+        temp_storage_capacity_(0ul),
+        cand_flag_(NULL),
+        cand_flag_capacity_(0u),
+        d_new_cand_count_{NULL, NULL},
+        temp_tries_(),
+        temp_tries_capacity_{{0u,0u,0u}, {0u,0u,0u}},
+        helper_relation_{NULL, NULL},
+        helper_relation_capacity_{0u},
+        range_array_(NULL),
+        range_array_capacity_(0u),
+        range_helper_array_(NULL),
+        range_helper_array_capacity_(0u),
+        helper_bool_array_{NULL, NULL},
+        helper_bool_array_capacity_{0u, 0u},
+        local_nbr_(),
+        local_nbr_capacity_{0u},
+        cum_bn_(),
 
-, res_(0ul)
-, res_size_(0ul)
-, new_res_(0ul)
-, new_res_size_(NULL)
-, h_new_res_size_(0ul)
-, h_max_new_res_size_(0ul)
-, cur_depth_(0u)
-, new_depth_(0u)
+        res_(0ul),
+        res_size_(0ul),
+        new_res_(0ul),
+        new_res_size_(NULL),
+        h_new_res_size_(0ul),
+        h_max_new_res_size_(0ul),
+        cur_depth_(0u),
+        new_depth_(0u),
 
-, nbr_mem_pool_()
-, res_queue_()
-, res_size_cartesian_product_(NULL)
-, max_res_size_cartesian_product_(NULL)
-{
+        nbr_mem_pool_(),
+        nbr_is_update_mem_pool_(),
+        res_queue_(),
+        res_size_cartesian_product_(NULL),
+        max_res_size_cartesian_product_(NULL) {
     nbr_mem_pool_.Alloc(NBR_SPACE);
+    nbr_is_update_mem_pool_.Alloc(NBR_IS_UPDATE_SPACE);
     cudaErrorCheck(cudaMalloc(&max_res_size_cartesian_product_, sizeof(unsigned long)));
 
     cudaErrorCheck(cudaMalloc(&d_new_cand_count_[0], sizeof(uint32_t)));
@@ -84,46 +109,54 @@ MatchGPU::MatchGPU(
     cudaErrorCheck(cudaMalloc(&new_res_size_, sizeof(unsigned long long int)));
 }
 
-MatchGPU::MatchGPU(
-    const GraphFileIoManager& graph_file_io, 
-    const QueryGraph& query,
-    const PlanManager& plan,
-    const AutomorphismManager *am_ptr)
-: query_(query)
-, plan_(plan)
-, am_ptr_(am_ptr)
-, data_graph_all_nbrs_{NULL}
-, index_all_nbrs_{NULL}
+MatchGPU::MatchGPU(const GraphFileIoManager& graph_file_io, 
+                   const QueryGraph& query,
+                   const PlanManager& plan,
+                   const AutomorphismManager *am_ptr): 
+        query_(query),
+        plan_(plan),
+        am_ptr_(am_ptr),
+        data_graph_all_nbrs_{NULL},
+        data_graph_all_nbrs_is_update_{NULL},
+        index_all_nbrs_{NULL},
+        index_all_nbrs_is_update_{NULL},
 
-, d_temp_storage_(NULL)
-, temp_storage_bytes_(0ul)
-, temp_storage_capacity_(0ul)
-, cand_flag_(NULL)
-, cand_flag_capacity_(0u)
-, d_new_cand_count_{NULL, NULL}
-, temp_tries_()
-, temp_tries_capacity_{{0u,0u,0u}, {0u,0u,0u}}
-, helper_relation_{NULL, NULL}
-, helper_relation_capacity_{0u}
-, local_nbr_()
-, local_nbr_capacity_{0u}
-, cum_bn_()
+        d_temp_storage_(NULL),
+        temp_storage_bytes_(0ul),
+        temp_storage_capacity_(0ul),
+        cand_flag_(NULL),
+        cand_flag_capacity_(0u),
+        d_new_cand_count_{NULL, NULL},
+        temp_tries_(),
+        temp_tries_capacity_{{0u,0u,0u}, {0u,0u,0u}},
+        helper_relation_{NULL, NULL},
+        helper_relation_capacity_{0u},
+        range_array_(NULL),
+        range_array_capacity_(0u),
+        range_helper_array_(NULL),
+        range_helper_array_capacity_(0u),
+        helper_bool_array_{NULL, NULL},
+        helper_bool_array_capacity_{0u, 0u},
+        local_nbr_(),
+        local_nbr_capacity_{0u},
+        cum_bn_(),
 
-, res_(0ul)
-, res_size_(0ul)
-, new_res_(0ul)
-, new_res_size_(NULL)
-, h_new_res_size_(0ul)
-, h_max_new_res_size_(0ul)
-, cur_depth_(0u)
-, new_depth_(0u)
+        res_(0ul),
+        res_size_(0ul),
+        new_res_(0ul),
+        new_res_size_(NULL),
+        h_new_res_size_(0ul),
+        h_max_new_res_size_(0ul),
+        cur_depth_(0u),
+        new_depth_(0u),
 
-, nbr_mem_pool_()
-, res_queue_()
-, res_size_cartesian_product_(NULL)
-, max_res_size_cartesian_product_(NULL)
-{
+        nbr_mem_pool_(),
+        nbr_is_update_mem_pool_(),
+        res_queue_(),
+        res_size_cartesian_product_(NULL),
+        max_res_size_cartesian_product_(NULL) {
     nbr_mem_pool_.Alloc(NBR_SPACE);
+    nbr_is_update_mem_pool_.Alloc(NBR_IS_UPDATE_SPACE);
     cudaErrorCheck(cudaMalloc(&max_res_size_cartesian_product_, sizeof(unsigned long)));
 
     cudaErrorCheck(cudaMalloc(&d_new_cand_count_[0], sizeof(uint32_t)));
@@ -132,9 +165,9 @@ MatchGPU::MatchGPU(
     cudaErrorCheck(cudaMalloc(&new_res_size_, sizeof(unsigned long long int)));
 }
 
-MatchGPU::~MatchGPU()
-{
+MatchGPU::~MatchGPU() {
     nbr_mem_pool_.Free();
+    nbr_is_update_mem_pool_.Free();
 
     cudaErrorCheck(cudaFree(new_res_size_));
 
@@ -151,7 +184,10 @@ MatchGPU::~MatchGPU()
         if (temp_tries_capacity_[i].es_capacity_ > 0u) cudaErrorCheck(cudaFree(temp_tries_[i].nbrs_));
 
         if (helper_relation_capacity_[i] > 0u) cudaErrorCheck(cudaFree(helper_relation_[i]));
+        if (helper_bool_array_capacity_[i] > 0u) cudaErrorCheck(cudaFree(helper_bool_array_[i]));
     }
+    if (range_array_capacity_ > 0u) cudaErrorCheck(cudaFree(range_array_));
+    if (range_helper_array_capacity_ > 0u) cudaErrorCheck(cudaFree(range_helper_array_));
 
     for (auto i = 0u; i < QE_COUNT; i++)
     {
@@ -208,8 +244,7 @@ void MatchGPU::GammaLoadPlan()
     cudaErrorCheck(cudaMemcpyToSymbol(C_NON_TAIL_LEAF_DEPTHS, non_tail_leaf_depths.data(), sizeof(uint8_t) * non_tail_leaf_depths.size()));
 }
 
-void MatchGPU::BuildTries(const EdgeBatch& edge_lists, CSR_GPU csr_gpu[], const uint8_t i)
-{
+void MatchGPU::BuildTries(const EdgeBatch& edge_lists, CSR_GPU csr_gpu[], const uint8_t i) {
     // build csr_gpu based on the initial edge lists
 
     // uint32_t temp;  // 250216
@@ -230,10 +265,8 @@ void MatchGPU::BuildTries(const EdgeBatch& edge_lists, CSR_GPU csr_gpu[], const 
     // cout << "temp2: " << temp2 << std::endl;  // 250216
 }
 
-void MatchGPU::DeallocTries(CSR_GPU csr_gpu[])
-{
-    for (auto i = 0u; i < QE_COUNT * 2u; i++)
-    {
+void MatchGPU::DeallocTries(CSR_GPU csr_gpu[]) {
+    for (auto i = 0u; i < QE_COUNT * 2u; i++) {
         csr_gpu[i].vs_size_ = 0u;
         csr_gpu[i].es_size_ = 0u;
         cudaErrorCheck(cudaFree(csr_gpu[i].vs_));
@@ -242,11 +275,9 @@ void MatchGPU::DeallocTries(CSR_GPU csr_gpu[])
     }
 }
 
-void MatchGPU::AllocRelations(
-    const DataGraphManager& data_graph, const CSR_GPU csr_gpu[],
-    RelationsGPU& data_graph_gpu, RelationsGPU& global_index_gpu, 
-    CandidatesGPU& global_bitmap_gpu
-) {
+void MatchGPU::AllocRelations(const DataGraphManager& data_graph, const CSR_GPU csr_gpu[],
+                              RelationsGPU& data_graph_gpu, RelationsGPU& global_index_gpu, 
+                              CandidatesGPU& global_bitmap_gpu) {
     cudaErrorCheck(cudaMemcpyToSymbol(C_DV_COUNT, &DV_COUNT, sizeof(uint32_t)));
     uint32_t *dvlabels, *capacity_prefix_sum;
 
@@ -256,20 +287,23 @@ void MatchGPU::AllocRelations(
     cudaErrorCheck(cudaMalloc(&capacity_prefix_sum, sizeof(uint32_t) * (DV_COUNT + 1u)));
 
     // allocate memory for each relation in the data graph and the index
-    for (auto i = 0u; i < QE_COUNT; i++)
-    {
+    for (auto i = 0u; i < QE_COUNT; i++) {
         AllocRelation(query_.qe_eidx_[i].first, csr_gpu[query_.qe_eidx_[i].first], 
             query_.qe_list_[i].first, dvlabels, 
             data_graph_gpu, global_index_gpu, capacity_prefix_sum,
             data_graph_all_nbrs_[query_.qe_eidx_[i].first],
+            data_graph_all_nbrs_is_update_[query_.qe_eidx_[i].first],
             index_all_nbrs_[query_.qe_eidx_[i].first],
+            index_all_nbrs_is_update_[query_.qe_eidx_[i].first],
             query_.first_NL_[query_.qe_eidx_[i].first] == query_.qe_eidx_[i].first ||
             query_.last_NL_[query_.qe_eidx_[i].first] == query_.qe_eidx_[i].first);
         AllocRelation(query_.qe_eidx_[i].second, csr_gpu[query_.qe_eidx_[i].second], 
             query_.qe_list_[i].second, dvlabels, 
             data_graph_gpu, global_index_gpu, capacity_prefix_sum,
             data_graph_all_nbrs_[query_.qe_eidx_[i].second],
+            data_graph_all_nbrs_is_update_[query_.qe_eidx_[i].second],
             index_all_nbrs_[query_.qe_eidx_[i].second],
+            index_all_nbrs_is_update_[query_.qe_eidx_[i].second],
             query_.first_NL_[query_.qe_eidx_[i].second] == query_.qe_eidx_[i].second ||
             query_.last_NL_[query_.qe_eidx_[i].second] == query_.qe_eidx_[i].second);
     }
@@ -278,55 +312,51 @@ void MatchGPU::AllocRelations(
     cudaErrorCheck(cudaFree(capacity_prefix_sum));
 
     // allocate the candidate bits arrays
-    for (auto i = 0u; i < QV_COUNT; i++)
-    {
+    for (auto i = 0u; i < QV_COUNT; i++) {
         cudaErrorCheck(cudaMalloc(&global_bitmap_gpu.candidate_bits_[i], sizeof(uint32_t) * DIV_CEIL(DV_COUNT, 32u)));
         cudaErrorCheck(cudaMemset(global_bitmap_gpu.candidate_bits_[i], 0u, sizeof(uint32_t) * DIV_CEIL(DV_COUNT, 32u)));
     }
 }
 
-void MatchGPU::DeallocRelations(
-    RelationsGPU& data_graph_gpu, RelationsGPU& global_index_gpu, 
-    CandidatesGPU& global_bitmap_gpu
-) {
-    for (auto i = 0u; i < QV_COUNT; i++)
-    {
+void MatchGPU::DeallocRelations(RelationsGPU& data_graph_gpu, 
+                                RelationsGPU& global_index_gpu, 
+                                CandidatesGPU& global_bitmap_gpu) {
+    for (auto i = 0u; i < QV_COUNT; i++) {
         cudaErrorCheck(cudaFree(global_bitmap_gpu.candidate_bits_[i]));
     }
-    for (auto i = 0u; i < QE_COUNT; i++)
-    {
-        for (const auto& idx: {query_.qe_eidx_[i].first, query_.qe_eidx_[i].second})
-        {
-            if (query_.first_NL_[idx] == idx || query_.last_NL_[idx] == idx)
-            {
+    for (auto i = 0u; i < QE_COUNT; i++) {
+        for (const auto& idx: {query_.qe_eidx_[i].first, query_.qe_eidx_[i].second}) {
+            if (query_.first_NL_[idx] == idx || query_.last_NL_[idx] == idx) {
                 cudaErrorCheck(cudaFree(data_graph_all_nbrs_[idx]));
+                cudaErrorCheck(cudaFree(data_graph_all_nbrs_is_update_[idx]));
                 cudaErrorCheck(cudaFree(data_graph_gpu.nbrs_[idx]));
+                cudaErrorCheck(cudaFree(data_graph_gpu.nbrs_is_update_[idx]));
                 cudaErrorCheck(cudaFree(data_graph_gpu.capacity_[idx]));
                 cudaErrorCheck(cudaFree(data_graph_gpu.sizes_[idx]));
             }
 
             cudaErrorCheck(cudaFree(index_all_nbrs_[idx]));
+            cudaErrorCheck(cudaFree(index_all_nbrs_is_update_[idx]));
+            // if (index_all_nbrs_is_update_[idx] != NULL)
+            // {
+            // }
             cudaErrorCheck(cudaFree(global_index_gpu.nbrs_[idx]));
+            cudaErrorCheck(cudaFree(global_index_gpu.nbrs_is_update_[idx]));
             cudaErrorCheck(cudaFree(global_index_gpu.capacity_[idx]));
             cudaErrorCheck(cudaFree(global_index_gpu.sizes_[idx]));
         }
     }
 }
 
-void MatchGPU::AllocOnline(
-    RelationsGPU& local_index_base_gpu, CandidatesGPU& local_bitmap_gpu
-) {
-    for (auto i = 0u; i < QE_COUNT; i++)
-    {
-        for (const auto& idx: {query_.qe_eidx_[i].first, query_.qe_eidx_[i].second})
-        {
+void MatchGPU::AllocOnline(RelationsGPU& local_index_base_gpu, CandidatesGPU& local_bitmap_gpu) {
+    for (auto i = 0u; i < QE_COUNT; i++) {
+        for (const auto& idx: {query_.qe_eidx_[i].first, query_.qe_eidx_[i].second}) {
             cudaErrorCheck(cudaMalloc(&local_index_base_gpu.sizes_[idx], sizeof(uint32_t) * (DV_COUNT + 1u)));
             cudaErrorCheck(cudaMalloc(&local_index_base_gpu.capacity_[idx], sizeof(uint32_t) * (DV_COUNT + 1u)));
             cudaErrorCheck(cudaMalloc(&local_index_base_gpu.nbrs_[idx], sizeof(uint32_t*) * (DV_COUNT)));
         }
     }
-    for (auto i = 0u; i < QV_COUNT; i++)
-    {
+    for (auto i = 0u; i < QV_COUNT; i++) {
         cudaErrorCheck(cudaMalloc(&local_bitmap_gpu.candidate_bits_[i], sizeof(uint32_t) * DIV_CEIL(DV_COUNT, 32u)));
         cudaErrorCheck(cudaMemset(local_bitmap_gpu.candidate_bits_[i], 0u, sizeof(uint32_t) * DIV_CEIL(DV_COUNT, 32u)));
     }
@@ -339,20 +369,15 @@ void MatchGPU::AllocOnline(
     cudaErrorCheck(cudaMemcpyToSymbol(C_RES_QUEUE, &res_queue_, sizeof(CyclicQueue<uint32_t>)));
 }
 
-void MatchGPU::DeallocOnline(
-    RelationsGPU& local_index_base_gpu, CandidatesGPU& local_bitmap_gpu
-) {
+void MatchGPU::DeallocOnline(RelationsGPU& local_index_base_gpu, CandidatesGPU& local_bitmap_gpu) {
     cudaErrorCheck(cudaFree(res_size_cartesian_product_));
     res_queue_.Free();
     cudaErrorCheck(cudaFree(cum_bn_));
-    for (auto i = 0u; i < QV_COUNT; i++)
-    {
+    for (auto i = 0u; i < QV_COUNT; i++) {
         cudaErrorCheck(cudaFree(local_bitmap_gpu.candidate_bits_[i]));
     }
-    for (auto i = 0u; i < QE_COUNT; i++)
-    {
-        for (const auto& idx: {query_.qe_eidx_[i].first, query_.qe_eidx_[i].second})
-        {
+    for (auto i = 0u; i < QE_COUNT; i++) {
+        for (const auto& idx: {query_.qe_eidx_[i].first, query_.qe_eidx_[i].second}) {
             cudaErrorCheck(cudaFree(local_index_base_gpu.sizes_[idx]));
             cudaErrorCheck(cudaFree(local_index_base_gpu.capacity_[idx]));
             cudaErrorCheck(cudaFree(local_index_base_gpu.nbrs_[idx]));
@@ -360,37 +385,31 @@ void MatchGPU::DeallocOnline(
     }
 }
 
-void MatchGPU::SetGraphPtrs(RelationsGPU& data_graph_gpu)
-{
-    for (auto i = 0u; i < QE_COUNT; i++)
-    {
-        for (auto j = 0u; j < 2u; j++)
-        {
+void MatchGPU::SetGraphPtrs(RelationsGPU& data_graph_gpu) {
+    for (auto i = 0u; i < QE_COUNT; i++) {
+        for (auto j = 0u; j < 2u; j++) {
             const auto& idx = j == 0u ? query_.qe_eidx_[i].first : query_.qe_eidx_[i].second;
-            if (idx != query_.first_NL_[idx])
-            {
+            if (idx != query_.first_NL_[idx]) {
                 data_graph_gpu.nbrs_[idx] = data_graph_gpu.nbrs_[query_.last_NL_[idx]];
+                data_graph_gpu.nbrs_is_update_[idx] = data_graph_gpu.nbrs_is_update_[query_.last_NL_[idx]];
                 data_graph_gpu.sizes_[idx] = data_graph_gpu.sizes_[query_.last_NL_[idx]];
             }
-            else
-            {
+            else {
                 // Doubt: Seems no-op, as idx == query_.first_NL_[idx].
                 data_graph_gpu.nbrs_[idx] = data_graph_gpu.nbrs_[query_.first_NL_[idx]];
+                data_graph_gpu.nbrs_is_update_[idx] = data_graph_gpu.nbrs_is_update_[query_.first_NL_[idx]];
                 data_graph_gpu.sizes_[idx] = data_graph_gpu.sizes_[query_.first_NL_[idx]];
             }
         }
     }
 }
 
-void MatchGPU::GetSummary(
-    const RelationsGPU& global_index_gpu, uint32_t *cardinalities, float *degrees
-) {
+void MatchGPU::GetSummary(const RelationsGPU& global_index_gpu, uint32_t *cardinalities, float *degrees) {
     uint32_t h_temp[2], *d_temp;
     // cout << "before cudaMalloc" << std::endl;
     cudaErrorCheck(cudaMalloc(&d_temp, sizeof(uint32_t) * 2u));
     // cout << "before for-loop" << std::endl;
-    for (auto i = 0u; i < QE_COUNT * 2; i++)
-    {
+    for (auto i = 0u; i < QE_COUNT * 2; i++) {
         cudaErrorCheck(cudaMemset(d_temp, 0u, sizeof(uint32_t) * 2u));
         // i is the current edge_idx
         // *d_temp <- edge_count; *(d_temp + 1) <- num_source_vertices in global_index_gpu.xxx[i]
@@ -404,10 +423,8 @@ void MatchGPU::GetSummary(
     }
 }
 
-void MatchGPU::UpdateGlobalIndex(
-    RelationsGPU& data_graph_gpu, RelationsGPU& global_index_gpu, 
-    CandidatesGPU& global_bitmap_gpu, const CSR_GPU csr_gpu[], const uint8_t i
-) {
+void MatchGPU::InitiallyUpdateGlobalIndex(RelationsGPU& data_graph_gpu, RelationsGPU& global_index_gpu, 
+                                          CandidatesGPU& global_bitmap_gpu, const CSR_GPU csr_gpu[], const uint8_t i) {
     // update the candidate edges of the query edges adjacent u or uu
     for (auto j = 0u; j < 2u; j++)
     {
@@ -450,12 +467,12 @@ void MatchGPU::UpdateGlobalIndex(
         // cout << "csr_gpu[idx].vs_: " << csr_gpu[idx].vs_ << std::endl;  // 250216
         // cout << "d_temp_storage_: " << d_temp_storage_ << std::endl;  // 250216
 
-        uint32_t *temp_dest = new uint32_t[csr_gpu[idx].vs_size_];
-        cudaErrorCheck(cudaMemcpy(temp_dest, csr_gpu[idx].vs_, sizeof(uint32_t) * csr_gpu[idx].vs_size_, cudaMemcpyDeviceToHost));
-        bool *temp_bool_dest = new bool[csr_gpu[idx].vs_size_];
-        cudaErrorCheck(cudaMemcpy(temp_bool_dest, cand_flag_, sizeof(bool) * csr_gpu[idx].vs_size_, cudaMemcpyDeviceToHost));
-        uint32_t *temp_dest2 = new uint32_t[csr_gpu[idx].vs_size_];
-        cudaErrorCheck(cudaMemcpy(temp_dest2, temp_tries_[0].vs_, sizeof(uint32_t) * csr_gpu[idx].vs_size_, cudaMemcpyDeviceToHost));
+        // uint32_t *temp_dest = new uint32_t[csr_gpu[idx].vs_size_];
+        // cudaErrorCheck(cudaMemcpy(temp_dest, csr_gpu[idx].vs_, sizeof(uint32_t) * csr_gpu[idx].vs_size_, cudaMemcpyDeviceToHost));
+        // bool *temp_bool_dest = new bool[csr_gpu[idx].vs_size_];
+        // cudaErrorCheck(cudaMemcpy(temp_bool_dest, cand_flag_, sizeof(bool) * csr_gpu[idx].vs_size_, cudaMemcpyDeviceToHost));
+        // uint32_t *temp_dest2 = new uint32_t[csr_gpu[idx].vs_size_];
+        // cudaErrorCheck(cudaMemcpy(temp_dest2, temp_tries_[0].vs_, sizeof(uint32_t) * csr_gpu[idx].vs_size_, cudaMemcpyDeviceToHost));
         // for (int i = 0; i < csr_gpu[idx].vs_size_; i++) {
         //     if (temp_bool_dest[i] == false) {
         //         cout << "temp_dest[" << i << "]: " << temp_dest[i] << ", temp_bool_dest[" << i << "]: " << temp_bool_dest[i] << ", temp_dest2[" << i << "]: " << temp_dest2[i] << std::endl;
@@ -563,7 +580,9 @@ void MatchGPU::UpdateGlobalIndex(
 
             // add the temp_tries to the index
             // Question (Solved): Why add the edges in `temp_tries_[0]` to `global_index_gpu`? Answer: temp_tries[0] contains updated edges.
-            addTriesToGraph<<<GRID_DIM, BLOCK_DIM>>>(temp_tries_[0], global_index_gpu, k, nbr_mem_pool_);
+            // addTriesToGraph<<<GRID_DIM, BLOCK_DIM>>>(temp_tries_[0], global_index_gpu, k, nbr_mem_pool_);
+            addTriesToIndex<<<GRID_DIM, BLOCK_DIM>>>(temp_tries_[0], global_index_gpu, k, nbr_mem_pool_, 
+                                                     nbr_is_update_mem_pool_, /*b_is_update=*/false);
             cudaErrorCheck(cudaDeviceSynchronize());
             if (nbr_mem_pool_.OutOfMemory())
             {
@@ -581,7 +600,9 @@ void MatchGPU::UpdateGlobalIndex(
 
             // add the temp_rcsr_gpu to the index
             // Question (Solved): Why add the edges in `temp_tries_[1]` to `global_index_gpu`? Answer: temp_tries[1] contains (reversed) udpated edges.
-            addTriesToGraph<<<GRID_DIM, BLOCK_DIM>>>(temp_tries_[1], global_index_gpu, query_.eidx_[u_other * QV_COUNT + u], nbr_mem_pool_);
+            // addTriesToGraph<<<GRID_DIM, BLOCK_DIM>>>(temp_tries_[1], global_index_gpu, query_.eidx_[u_other * QV_COUNT + u], nbr_mem_pool_);
+            addTriesToIndex<<<GRID_DIM, BLOCK_DIM>>>(temp_tries_[1], global_index_gpu, query_.eidx_[u_other * QV_COUNT + u],
+                                                     nbr_mem_pool_, nbr_is_update_mem_pool_, /*b_is_update=*/false);
             cudaErrorCheck(cudaDeviceSynchronize());
             if (nbr_mem_pool_.OutOfMemory())
             {
@@ -600,7 +621,9 @@ void MatchGPU::UpdateGlobalIndex(
         if (query_.first_NL_[idx] == idx || query_.last_NL_[idx] == idx)
         {
             // add all edges mapped to the current query edge to the data graph
-            addTriesToGraph<<<GRID_DIM, BLOCK_DIM>>>(csr_gpu[idx], data_graph_gpu, idx, nbr_mem_pool_);
+            // addTriesToGraph<<<GRID_DIM, BLOCK_DIM>>>(csr_gpu[idx], data_graph_gpu, idx, nbr_mem_pool_);
+            addTriesToIndex<<<GRID_DIM, BLOCK_DIM>>>(csr_gpu[idx], data_graph_gpu, idx, nbr_mem_pool_,
+                                                     nbr_is_update_mem_pool_, /*b_is_update=*/false);
             cudaErrorCheck(cudaDeviceSynchronize());
             if (nbr_mem_pool_.OutOfMemory())
             {
@@ -620,10 +643,267 @@ void MatchGPU::UpdateGlobalIndex(
 
         SelectEdgesFromTrie(csr_gpu[idx], temp_tries_[0], global_bitmap_gpu.candidate_bits_[u], global_bitmap_gpu.candidate_bits_[uu]);
 
-        addTriesToGraph<<<GRID_DIM, BLOCK_DIM>>>(temp_tries_[0], global_index_gpu, idx, nbr_mem_pool_);
+        // addTriesToGraph<<<GRID_DIM, BLOCK_DIM>>>(temp_tries_[0], global_index_gpu, idx, nbr_mem_pool_);
+        addTriesToIndex<<<GRID_DIM, BLOCK_DIM>>>(temp_tries_[0], global_index_gpu, idx, nbr_mem_pool_, 
+                                                 nbr_is_update_mem_pool_, /*b_is_update=*/false);
         cudaErrorCheck(cudaDeviceSynchronize());
         if (nbr_mem_pool_.OutOfMemory())
         {
+            exit(-1);
+        }
+    }
+}
+
+void MatchGPU::UpdateGlobalIndex(RelationsGPU& data_graph_gpu, RelationsGPU& global_index_gpu, 
+                                 CandidatesGPU& global_bitmap_gpu, const CSR_GPU csr_gpu[], const uint8_t i) {
+    // update the candidate edges of the query edges adjacent u or uu
+    for (auto j = 0u; j < 2u; j++) {
+        // cout << "inside UpdateGlobalIndex - first for loop, j: " << j << std::endl;  // 250216
+        const auto& idx = j == 0u ? query_.qe_eidx_[i].first : query_.qe_eidx_[i].second;
+        const auto& u = j == 0u ? query_.qe_list_[i].first : query_.qe_list_[i].second;
+        const auto& uu = j == 0u ? query_.qe_list_[i].second : query_.qe_list_[i].first;
+
+        // find new candidates of u (satisfies NLF after the update), and write to the trie
+        ReAlloc(cand_flag_, csr_gpu[idx].vs_size_, cand_flag_capacity_, bool);
+        cudaErrorCheck(cudaMemset(cand_flag_, false, sizeof(bool) * cand_flag_capacity_));
+        cudaErrorCheck(cudaDeviceSynchronize());
+
+        if (query_.NLF_[idx] == 0) continue;
+        // Apply NLFs (considering the initial graph data_graph_gpu and new edges in csr_gpu[idx]). 
+        // Write values to global_bitmap_gpu.candidate_bits_[u] and cand_flag_. (Add NLF-valid data vertices into candidates.)
+        getGlobalCandidates<<<GRID_DIM, BLOCK_DIM>>>(data_graph_gpu, idx, csr_gpu[idx], global_bitmap_gpu.candidate_bits_[u], 
+                                                     cand_flag_, u);
+        cudaErrorCheck(cudaDeviceSynchronize());
+
+        // cout << "inside UpdateGlobalIndex - after getGlobalCandidates, d_new_cand_count_[0]: " << d_new_cand_count_[0] << std::endl;  // 250216
+        // cout << "inside UpdateGlobalIndex - after getGlobalCandidates, d_new_cand_count_[1]: " << d_new_cand_count_[1] << std::endl;  // 250216
+        // uint32_t temp2;  // 250216
+        // cudaErrorCheck(cudaMemcpy(&temp2, d_new_cand_count_[0], sizeof(uint32_t), cudaMemcpyDeviceToHost));  // 250216
+        // cout << "temp2: " << temp2 << std::endl;  // 250216
+        // cudaErrorCheck(cudaMemcpy(&temp2, d_new_cand_count_[1], sizeof(uint32_t), cudaMemcpyDeviceToHost));  // 250216
+        // cout << "temp2: " << temp2 << std::endl;  // 250216
+
+        // allocate temp_tries.vs_ and temp_tries.offs_
+        ReAlloc(temp_tries_[0].vs_, csr_gpu[idx].vs_size_, temp_tries_capacity_[0].vs_capacity_, uint32_t);
+        // cudaErrorCheck(cudaDeviceSynchronize());  // 250216
+
+        // cout << "inside UpdateGlobalIndex - before cub::DeviceSelect::Flagged" << std::endl;  // 250216
+        // cout << "csr_gpu[idx].vs_size_: " << csr_gpu[idx].vs_size_ << std::endl;  // 250216
+        // cout << "cand_flag_capacity_: " << cand_flag_capacity_ << std::endl;  // 250216
+        // cout << "bool* cand_flag_: " << cand_flag_ << std::endl;  // 250216
+        // cout << "uint32_t* (temp_tries_[0].vs_): " << temp_tries_[0].vs_ << std::endl;  // 250216
+        // cout << "idx: " << idx << std::endl;  // 250216
+        // cout << "csr_gpu[idx].vs_: " << csr_gpu[idx].vs_ << std::endl;  // 250216
+        // cout << "d_temp_storage_: " << d_temp_storage_ << std::endl;  // 250216
+
+        // uint32_t *temp_dest = new uint32_t[csr_gpu[idx].vs_size_];
+        // cudaErrorCheck(cudaMemcpy(temp_dest, csr_gpu[idx].vs_, sizeof(uint32_t) * csr_gpu[idx].vs_size_, cudaMemcpyDeviceToHost));
+        // bool *temp_bool_dest = new bool[csr_gpu[idx].vs_size_];
+        // cudaErrorCheck(cudaMemcpy(temp_bool_dest, cand_flag_, sizeof(bool) * csr_gpu[idx].vs_size_, cudaMemcpyDeviceToHost));
+        // uint32_t *temp_dest2 = new uint32_t[csr_gpu[idx].vs_size_];
+        // cudaErrorCheck(cudaMemcpy(temp_dest2, temp_tries_[0].vs_, sizeof(uint32_t) * csr_gpu[idx].vs_size_, cudaMemcpyDeviceToHost));
+        // for (int i = 0; i < csr_gpu[idx].vs_size_; i++) {
+        //     if (temp_bool_dest[i] == false) {
+        //         cout << "temp_dest[" << i << "]: " << temp_dest[i] << ", temp_bool_dest[" << i << "]: " << temp_bool_dest[i] << ", temp_dest2[" << i << "]: " << temp_dest2[i] << std::endl;
+        //     }
+        //     // cout << "temp_dest[" << i << "]: " << temp_dest[i] << ", temp_bool_dest[" << i << "]: " << temp_bool_dest[i] << std::endl;
+        // }
+
+        // masked_select: csr_gpu[idx].vs_[cand_flag_] -> temp_tries_[0].vs_, 
+        // *d_new_cand_count_[0] is the result item count.
+        CUB(cub::DeviceSelect::Flagged(d_temp_storage_, temp_storage_bytes_, csr_gpu[idx].vs_, cand_flag_, temp_tries_[0].vs_, d_new_cand_count_[0], csr_gpu[idx].vs_size_));
+
+        // // cout << "before void *pre_d_temp_storage_ = d_temp_storage_, d_temp_storage_: " << d_temp_storage_ << std::endl;  // 250216
+        // void *pre_d_temp_storage_ = d_temp_storage_;  // 250216
+        // d_temp_storage_ = NULL;    // 250216
+        // cub::DeviceSelect::Flagged(d_temp_storage_, temp_storage_bytes_, csr_gpu[idx].vs_, cand_flag_, temp_tries_[0].vs_, d_new_cand_count_[0], csr_gpu[idx].vs_size_);    // 250216
+        // cudaErrorCheck(cudaDeviceSynchronize());  // 250216
+        // // cout << "before if, temp_storage_bytes_: " << temp_storage_bytes_ << std::endl;  // 250216
+        // if (temp_storage_bytes_ > temp_storage_capacity_)    // 250216
+        // {
+        //     if (temp_storage_capacity_ != 0ul)    // 250216
+        //     {
+        //         cudaErrorCheck(cudaFree(pre_d_temp_storage_));    // 250216
+        //     }
+        //     cout << "inside if" << std::endl;  // 250216
+        //     temp_storage_bytes_ = temp_storage_capacity_ = 
+        //         (size_t)exp2(ceil(log2(temp_storage_bytes_)));    // 250216
+        //     cudaErrorCheck(cudaMalloc(
+        //         &d_temp_storage_, temp_storage_bytes_));    // 250216
+        //     cub::DeviceSelect::Flagged(d_temp_storage_, temp_storage_bytes_, csr_gpu[idx].vs_, cand_flag_, temp_tries_[0].vs_, d_new_cand_count_[0], csr_gpu[idx].vs_size_);    // 250216
+        //     cudaErrorCheck(cudaDeviceSynchronize());  // 250216
+        
+        // }
+        // else
+        // {
+        //     cout << "inside else" << std::endl;  // 250216
+        //     d_temp_storage_ = pre_d_temp_storage_;    // 250216
+        // }
+        // // cout << "temp_storage_bytes_: " << temp_storage_bytes_ << std::endl;  // 250216
+        // // cout << "temp_storage_capacity_: " << temp_storage_capacity_ << std::endl;  // 250216
+        // // cout << "d_temp_storage_: " << d_temp_storage_ << std::endl;  // 250216
+        
+        // size_t freeMem, totalMem;  // 250216
+        // cudaErrorCheck(cudaMemGetInfo(&freeMem, &totalMem));  // 250216
+        // std::cout << "Total GPU memory: " << totalMem / 1024 / 1024 << " MB" << std::endl;  // 250216
+        // std::cout << "Free GPU memory: " << freeMem / 1024 / 1024 << " MB" << std::endl;  // 250216
+
+        // cudaErrorCheck(cudaMemcpy(&temp2, d_new_cand_count_[0], sizeof(uint32_t), cudaMemcpyDeviceToHost));  // 250216
+        // cout << "temp2: " << temp2 << std::endl;  // 250216
+        // cudaErrorCheck(cudaMemcpy(&temp2, d_new_cand_count_[1], sizeof(uint32_t), cudaMemcpyDeviceToHost));  // 250216
+        // cout << "temp2: " << temp2 << std::endl;  // 250216
+
+        // temp_tries_[0].vs_size_, i.e. CSR_GPU::vs_size_ is in CPU memory.
+        cudaErrorCheck(cudaMemcpy(&temp_tries_[0].vs_size_, d_new_cand_count_[0], sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        if (temp_tries_[0].vs_size_ == 0) {
+            continue;
+        }
+        ReAlloc(temp_tries_[0].offs_, csr_gpu[idx].vs_size_ + 1, temp_tries_capacity_[0].off_capacity_, uint32_t);
+
+        // check each relation adjacent to u
+        for (auto k = query_.qv_offs_[u]; k < query_.qv_offs_[u + 1]; k++) {
+            // k is the current edge_idx
+            const auto& u_other = query_.qv_nbrs_[k];
+
+            // allocate temp_tries.es_
+            // Calculate the number of valid data graph edges for each data graph source vertex in temp_tries_[0].vs_ and store the numbers in temp_tries_[0].offs_
+            // A valid data graph edge means that the destination vertex is in `global_bitmap_gpu.candidate_bits_[u_other]`
+            // Doubt: What if `global_bitmap_gpu.candidate_bits_[u_other]` has not been written (This may happen when invoked at initialization steps).
+            getGlobalCandidateEdgesCount<<<GRID_DIM, BLOCK_DIM>>>(data_graph_gpu, k, temp_tries_[0].vs_, temp_tries_[0].vs_size_,
+                                                                  global_bitmap_gpu.candidate_bits_[u_other], temp_tries_[0].offs_);
+            cudaErrorCheck(cudaDeviceSynchronize());
+
+            // exclusive_sum(temp_tries_[0].offs_0)
+            CUB(cub::DeviceScan::ExclusiveSum(d_temp_storage_, temp_storage_bytes_, temp_tries_[0].offs_, temp_tries_[0].offs_, temp_tries_[0].vs_size_ + 1));
+            cudaErrorCheck(cudaMemcpy(&temp_tries_[0].es_size_, &temp_tries_[0].offs_[temp_tries_[0].vs_size_], sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+            if (temp_tries_[0].es_size_ == 0) {
+                continue;
+            }
+
+            temp_tries_[1].es_size_ = temp_tries_[0].es_size_;
+
+            ReAlloc(temp_tries_[0].nbrs_, temp_tries_[0].es_size_, temp_tries_capacity_[0].es_capacity_, uint32_t);
+            ReAlloc(helper_relation_[0], temp_tries_[0].es_size_, helper_relation_capacity_[0], uint32_t);
+            ReAlloc(temp_tries_[1].nbrs_, temp_tries_[0].es_size_, temp_tries_capacity_[1].es_capacity_, uint32_t);
+            ReAlloc(helper_relation_[1], temp_tries_[0].es_size_, helper_relation_capacity_[1], uint32_t);
+
+            if (temp_tries_[0].es_size_ > range_array_capacity_) {
+                ReAlloc(range_array_, temp_tries_[0].es_size_, range_array_capacity_, uint32_t);
+                WriteRangeArray<<<GRID_DIM, BLOCK_DIM>>>(range_array_capacity_, range_array_);
+                cudaErrorCheck(cudaDeviceSynchronize());
+            }
+            ReAlloc(range_helper_array_, temp_tries_[0].es_size_, range_helper_array_capacity_, uint32_t);
+            ReAlloc(helper_bool_array_[0], temp_tries_[0].es_size_, helper_bool_array_capacity_[0], bool);
+            ReAlloc(helper_bool_array_[1], temp_tries_[0].es_size_, helper_bool_array_capacity_[1], bool);
+
+            // Seems that the size of temp_tries_[1].vs_ and temp_tries_[1].offs_ can be more than needed.
+            ReAlloc(temp_tries_[1].vs_, temp_tries_[0].es_size_, temp_tries_capacity_[1].vs_capacity_, uint32_t);
+            ReAlloc(temp_tries_[1].offs_, temp_tries_[0].es_size_ + 1, temp_tries_capacity_[1].off_capacity_, uint32_t);
+
+            // size_t freeMem, totalMem;  // 250624
+            // cudaErrorCheck(cudaMemGetInfo(&freeMem, &totalMem));  // 250624
+            // std::cout << "Total GPU memory: " << totalMem / 1024 / 1024 << " MB" << std::endl;  // 250624
+            // std::cout << "Free GPU memory: " << freeMem / 1024 / 1024 << " MB" << std::endl;  // 250624
+
+            // fill in temp_tries.es_
+            // Fill the source and destination vertices of valid data graph edges into helper_relation_[0] and temp_tries_[0].nbrs_, respectively
+            // Discussion: Checking the bitmap again here. (getGlobalCandidateEdgesCount has checked the bitmap)
+            // getGlobalCandidateEdgesWrite<<<GRID_DIM, BLOCK_DIM>>>(data_graph_gpu, k, temp_tries_[0].vs_, temp_tries_[0].vs_size_,
+            //                                                       global_bitmap_gpu.candidate_bits_[u_other], temp_tries_[0].offs_,
+            //                                                       helper_relation_[0], temp_tries_[0].nbrs_);
+            getGlobalCandidateEdgesWriteWithIsUpdate<<<GRID_DIM, BLOCK_DIM>>>(data_graph_gpu, k, 
+                                                                              temp_tries_[0].vs_,   
+                                                                              temp_tries_[0].vs_size_,
+                                                                              global_bitmap_gpu.candidate_bits_[u_other], 
+                                                                              temp_tries_[0].offs_,
+                                                                              helper_relation_[0], 
+                                                                              temp_tries_[0].nbrs_, 
+                                                                              helper_bool_array_[0]);
+            cudaErrorCheck(cudaDeviceSynchronize());
+
+            // add the temp_tries to the index
+            // Question (Solved): Why add the edges in `temp_tries_[0]` to `global_index_gpu`? Answer: temp_tries[0] contains updated edges.
+            // addTriesToGraph<<<GRID_DIM, BLOCK_DIM>>>(temp_tries_[0], global_index_gpu, k, nbr_mem_pool_);
+            // addTriesToIndex<<<GRID_DIM, BLOCK_DIM>>>(temp_tries_[0], global_index_gpu, k, nbr_mem_pool_, 
+            //                                          nbr_is_update_mem_pool_, /*b_is_update=*/false);
+            addTriesToIndexWithIsUpdateArray<<<GRID_DIM, BLOCK_DIM>>>(temp_tries_[0], global_index_gpu, k, nbr_mem_pool_, 
+                                                                      nbr_is_update_mem_pool_, helper_bool_array_[0]);
+            cudaErrorCheck(cudaDeviceSynchronize());
+            
+            if (nbr_mem_pool_.OutOfMemory()) {
+                exit(-1);
+            }
+
+            // reverse temp_tries_[0] into temp_tries_[1]
+            // CUB(cub::DeviceRadixSort::SortPairs(d_temp_storage_, temp_storage_bytes_, temp_tries_[0].nbrs_, 
+            //                                     helper_relation_[1], helper_relation_[0], temp_tries_[1].nbrs_, 
+            //                                     temp_tries_[0].es_size_));
+            CUB(cub::DeviceRadixSort::SortPairs(d_temp_storage_, temp_storage_bytes_, temp_tries_[0].nbrs_,
+                                                helper_relation_[1], range_array_, range_helper_array_,
+                                                temp_tries_[0].es_size_));
+            GatherValues<<<GRID_DIM, BLOCK_DIM>>>(helper_relation_[0], range_helper_array_, temp_tries_[0].es_size_,
+                                                  temp_tries_[1].nbrs_);
+            GatherValues<<<GRID_DIM, BLOCK_DIM>>>(helper_bool_array_[0], range_helper_array_, temp_tries_[0].es_size_,
+                                                  helper_bool_array_[1]);
+
+            CUB(cub::DeviceRunLengthEncode::Encode(d_temp_storage_, temp_storage_bytes_, helper_relation_[1], temp_tries_[1].vs_, 
+                                                   temp_tries_[1].offs_, d_new_cand_count_[1], temp_tries_[0].es_size_));
+            cudaErrorCheck(cudaMemcpy(&temp_tries_[1].vs_size_, d_new_cand_count_[1], sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+            CUB(cub::DeviceScan::ExclusiveSum(d_temp_storage_, temp_storage_bytes_, temp_tries_[1].offs_, temp_tries_[1].offs_, temp_tries_[1].vs_size_ + 1));
+
+            // add the temp_rcsr_gpu to the index
+            // Question (Solved): Why add the edges in `temp_tries_[1]` to `global_index_gpu`? Answer: temp_tries[1] contains (reversed) udpated edges.
+            // addTriesToGraph<<<GRID_DIM, BLOCK_DIM>>>(temp_tries_[1], global_index_gpu, query_.eidx_[u_other * QV_COUNT + u], nbr_mem_pool_);
+            // addTriesToIndex<<<GRID_DIM, BLOCK_DIM>>>(temp_tries_[1], global_index_gpu, query_.eidx_[u_other * QV_COUNT + u],
+            //                                          nbr_mem_pool_, nbr_is_update_mem_pool_, /*b_is_update=*/false);
+            addTriesToIndexWithIsUpdateArray<<<GRID_DIM, BLOCK_DIM>>>(temp_tries_[1], global_index_gpu,
+                                                                      query_.eidx_[u_other * QV_COUNT + u],
+                                                                      nbr_mem_pool_,
+                                                                      nbr_is_update_mem_pool_,
+                                                                      helper_bool_array_[1]);
+            cudaErrorCheck(cudaDeviceSynchronize());
+
+            if (nbr_mem_pool_.OutOfMemory()) {
+                exit(-1);
+            }
+        }
+    }
+    for (auto j = 0u; j < 2u; j++) {
+        const auto& idx = j == 0u ? query_.qe_eidx_[i].first : query_.qe_eidx_[i].second;
+        const auto& u = j == 0u ? query_.qe_list_[i].first : query_.qe_list_[i].second;
+        const auto& uu = j == 0u ? query_.qe_list_[i].second : query_.qe_list_[i].first;
+        
+        // cout << "inside UpdateGlobalIndex - second for loop, j: " << j << ", idx: " << idx << ", u: " << u << ", uu: " << uu << std::endl;  // 250216
+        
+        if (query_.first_NL_[idx] == idx || query_.last_NL_[idx] == idx) {
+            // add all edges mapped to the current query edge to the data graph
+            // addTriesToGraph<<<GRID_DIM, BLOCK_DIM>>>(csr_gpu[idx], data_graph_gpu, idx, nbr_mem_pool_);
+            addTriesToIndex<<<GRID_DIM, BLOCK_DIM>>>(csr_gpu[idx], data_graph_gpu, idx, nbr_mem_pool_,
+                                                     nbr_is_update_mem_pool_, /*b_is_update=*/true);
+            cudaErrorCheck(cudaDeviceSynchronize());
+            if (nbr_mem_pool_.OutOfMemory()) {
+                exit(-1);
+            }
+        }
+        else {
+            data_graph_gpu.nbrs_[idx] = data_graph_gpu.nbrs_[query_.first_NL_[idx]];
+            data_graph_gpu.sizes_[idx] = data_graph_gpu.sizes_[query_.first_NL_[idx]];
+        }
+
+        // add all edges with both endpoints being candidate to the index
+        ReAlloc(temp_tries_[0].vs_, csr_gpu[idx].vs_size_, temp_tries_capacity_[0].vs_capacity_, uint32_t);
+        ReAlloc(temp_tries_[0].offs_, csr_gpu[idx].vs_size_ + 1, temp_tries_capacity_[0].off_capacity_, uint32_t);
+        ReAlloc(temp_tries_[0].nbrs_, csr_gpu[idx].es_size_, temp_tries_capacity_[0].es_capacity_, uint32_t);
+
+        SelectEdgesFromTrie(csr_gpu[idx], temp_tries_[0], global_bitmap_gpu.candidate_bits_[u], global_bitmap_gpu.candidate_bits_[uu]);
+
+        // addTriesToGraph<<<GRID_DIM, BLOCK_DIM>>>(temp_tries_[0], global_index_gpu, idx, nbr_mem_pool_);
+        addTriesToIndex<<<GRID_DIM, BLOCK_DIM>>>(temp_tries_[0], global_index_gpu, idx, nbr_mem_pool_, 
+                                                 nbr_is_update_mem_pool_, /*b_is_update=*/true);
+        cudaErrorCheck(cudaDeviceSynchronize());
+        if (nbr_mem_pool_.OutOfMemory()) {
             exit(-1);
         }
     }
@@ -935,25 +1215,27 @@ void MatchGPU::BuildTriesFromEdgeList(
         rcsr_gpu.offs_, rcsr_gpu.offs_, rcsr_gpu.vs_size_ + 1));
 }
 
-void MatchGPU::AllocRelation(
-    const uint32_t idx, const CSR_GPU& csr_gpu,
-    const uint32_t u, const uint32_t *dvlabels, 
-    RelationsGPU& data_graph_gpu, RelationsGPU& global_index_gpu, 
-    uint32_t *capacity_prefix_sum,
-    uint32_t *data_graph_all_nbrs,
-    uint32_t *index_all_nbrs,
-    bool build_graph
-) {
+void MatchGPU::AllocRelation(const uint32_t idx, const CSR_GPU& csr_gpu,
+                             const uint32_t u, const uint32_t *dvlabels, 
+                             RelationsGPU& data_graph_gpu, RelationsGPU& global_index_gpu, 
+                             uint32_t *capacity_prefix_sum,
+                             uint32_t *data_graph_all_nbrs,
+                             bool *data_graph_all_nbrs_is_update,
+                             uint32_t *index_all_nbrs,
+                             bool *index_all_nbrs_is_update,
+                             bool build_graph) {
     // lgh: idx is edge_idx
     // a. malloc
     // cout << "DV_COUNT: " << DV_COUNT << std::endl;
     if (build_graph)
     {
         cudaErrorCheck(cudaMalloc(&data_graph_gpu.nbrs_[idx], sizeof(uint32_t*) * (DV_COUNT + 1)));
+        cudaErrorCheck(cudaMalloc(&data_graph_gpu.nbrs_is_update_[idx], sizeof(bool*) * (DV_COUNT + 1)));
         cudaErrorCheck(cudaMalloc(&data_graph_gpu.capacity_[idx], sizeof(uint32_t) * (DV_COUNT + 1)));
         cudaErrorCheck(cudaMalloc(&data_graph_gpu.sizes_[idx], sizeof(uint32_t) * (DV_COUNT + 1)));
     }
     cudaErrorCheck(cudaMalloc(&global_index_gpu.nbrs_[idx], sizeof(uint32_t*) * (DV_COUNT + 1)));
+    cudaErrorCheck(cudaMalloc(&global_index_gpu.nbrs_is_update_[idx], sizeof(bool*) * (DV_COUNT + 1)));
     cudaErrorCheck(cudaMalloc(&global_index_gpu.capacity_[idx], sizeof(uint32_t) * (DV_COUNT + 1)));
     cudaErrorCheck(cudaMalloc(&global_index_gpu.sizes_[idx], sizeof(uint32_t) * (DV_COUNT + 1)));
 
@@ -1001,19 +1283,29 @@ void MatchGPU::AllocRelation(
         cudaErrorCheck(cudaMemset(data_graph_all_nbrs, 0u, sizeof(uint32_t) * total_size));
         cudaErrorCheck(cudaDeviceSynchronize());
         setNeighborPointers<<<GRID_DIM, BLOCK_DIM>>>(data_graph_all_nbrs, capacity_prefix_sum, DV_COUNT, data_graph_gpu.nbrs_[idx]);
+
+        cudaErrorCheck(cudaMalloc(&data_graph_all_nbrs_is_update, sizeof(bool) * total_size));
+        cudaErrorCheck(cudaMemset(data_graph_all_nbrs_is_update, 0u, sizeof(bool) * total_size));
+        cudaErrorCheck(cudaDeviceSynchronize());
+        setNeighborIsUpdatePointers<<<GRID_DIM, BLOCK_DIM>>>(data_graph_all_nbrs_is_update, capacity_prefix_sum, DV_COUNT, 
+                                                             data_graph_gpu.nbrs_is_update_[idx]);
     }
     cudaErrorCheck(cudaMalloc(&index_all_nbrs, sizeof(uint32_t) * total_size));
     cudaErrorCheck(cudaMemset(index_all_nbrs, 0u, sizeof(uint32_t) * total_size));
     cudaErrorCheck(cudaDeviceSynchronize());
     setNeighborPointers<<<GRID_DIM, BLOCK_DIM>>>(index_all_nbrs, capacity_prefix_sum, DV_COUNT, global_index_gpu.nbrs_[idx]);
+
+    cudaErrorCheck(cudaMalloc(&index_all_nbrs_is_update, sizeof(bool) * total_size));
+    cudaErrorCheck(cudaMemset(index_all_nbrs_is_update, 0u, sizeof(bool) * total_size));
+    cudaErrorCheck(cudaDeviceSynchronize());
+    setNeighborIsUpdatePointers<<<GRID_DIM, BLOCK_DIM>>>(index_all_nbrs_is_update, capacity_prefix_sum, DV_COUNT, 
+                                                         global_index_gpu.nbrs_is_update_[idx]);
 }
 
-void MatchGPU::SelectEdgesFromTrie(
-    const CSR_GPU& input,
-    CSR_GPU& output,
-    const uint32_t *first_candidates,
-    const uint32_t *second_candidates
-) {
+void MatchGPU::SelectEdgesFromTrie(const CSR_GPU& input,
+                                   CSR_GPU& output,
+                                   const uint32_t *first_candidates,
+                                   const uint32_t *second_candidates) {
     output.vs_size_ = input.vs_size_;
     cudaErrorCheck(cudaMemcpy(output.vs_, input.vs_, sizeof(uint32_t) * input.vs_size_, cudaMemcpyDeviceToDevice));
 

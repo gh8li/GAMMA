@@ -111,6 +111,9 @@ class MatchGPU {
     void GetSummary(const RelationsGPU& global_index_gpu, 
                     uint32_t *cardinalities, float *degrees);
 
+    void InitiallyUpdateGlobalIndex(RelationsGPU& data_graph_gpu, RelationsGPU& global_index_gpu, 
+                                    CandidatesGPU& global_bitmap_gpu, const CSR_GPU csr_gpu[], const uint8_t i);
+
     void UpdateGlobalIndex(RelationsGPU& data_graph_gpu, RelationsGPU& global_index_gpu, 
                            CandidatesGPU& global_bitmap_gpu, const CSR_GPU csr_gpu[], const uint8_t i);
   
@@ -128,6 +131,9 @@ class MatchGPU {
     const AutomorphismManager *am_ptr_;
     uint32_t *data_graph_all_nbrs_[MAX_QE_COUNT * 2];
     uint32_t *index_all_nbrs_[MAX_QE_COUNT * 2];
+    
+    bool *data_graph_all_nbrs_is_update_[MAX_QE_COUNT * 2];
+    bool *index_all_nbrs_is_update_[MAX_QE_COUNT * 2];
 
     // uint32_t *data_graph_all_nbrs_[MAX_QE_COUNT * 2];
     // uint32_t *index_all_nbrs_[MAX_QE_COUNT * 2];
@@ -145,6 +151,15 @@ class MatchGPU {
     CSR_GPU_Capacity temp_tries_capacity_[2];
     uint32_t *helper_relation_[2];
     uint32_t helper_relation_capacity_[2];
+    
+    uint32_t *range_array_;
+    uint32_t range_array_capacity_;
+    
+    uint32_t *range_helper_array_;
+    uint32_t range_helper_array_capacity_;
+
+    bool *helper_bool_array_[2];
+    uint32_t helper_bool_array_capacity_[2];
 
     // Segments in the array `local_nbr_[edge_index]` are pointed to by the pointers 
     // in (RelationsGPU)local_index_base_gpu.nbrs_[edge_index] (an array of pointers).
@@ -167,6 +182,7 @@ class MatchGPU {
 
     // For memory allocation
     MemPool<uint32_t> nbr_mem_pool_;
+    MemPool<bool> nbr_is_update_mem_pool_;
     CyclicQueue<uint32_t> res_queue_;
     unsigned long *res_size_cartesian_product_;
     unsigned long *max_res_size_cartesian_product_;
@@ -178,7 +194,9 @@ class MatchGPU {
                        RelationsGPU& data_graph_gpu, RelationsGPU& global_index_gpu, 
                        uint32_t *capacity_prefix_sum,
                        uint32_t *data_graph_all_nbrs,
+                       bool *data_graph_all_nbrs_is_update,
                        uint32_t *index_all_nbrs,
+                       bool *index_all_nbrs_is_update,
                        bool build_graph);
     void SelectEdgesFromTrie(const CSR_GPU& input,
                              CSR_GPU& output,

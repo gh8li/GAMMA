@@ -18,6 +18,9 @@
 // #define NBR_SPACE (1ul * 1024 * 1024 * 1024 / sizeof(uint32_t)) // 1 GB of uint32_t  // 250217
 // #define NBR_SPACE (2ul * 1024 * 1024 * 1024 / sizeof(uint32_t)) // 2 GB of uint32_t  // 250218
 #define NBR_SPACE (1536 * 1024 * 1024 / sizeof(uint32_t)) // 1.5 GB of uint32_t  // 250218
+
+#define NBR_IS_UPDATE_SPACE (384 * 1024 * 1024 / sizeof(bool)) // roughly 0.38 GB of bool
+
 // #define RES_SPACE (2ul * 1024 * 1024 * 1024 / sizeof(uint32_t)) // 2 GB of uint32_t  // 250218
 #define RES_SPACE (3ul * 1024 * 1024 * 1024 / sizeof(uint32_t)) // 3 GB of uint32_t  // 250218
 // #define RES_SPACE (4ul * 1024 * 1024 * 1024 / sizeof(uint32_t)) // 4 GB of uint32_t  // default

@@ -7,7 +7,37 @@
 #include "utils/search.cuh"
 
 // #define IS_DEBUGGING
+#define DEDUPLICATE_RESULTS
+
 namespace {
+
+__device__ int compare_edges(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    uint32_t temp = 0;
+    if (a > b) {
+        temp = a;
+        a = b;
+        b = temp;
+    }
+    if (c > d) {
+        temp = c;
+        c = d;
+        d = temp;
+    }
+    if (a < c) {
+        return -1;
+    } else if (a > c) {
+        return 1;
+    } else {
+        if (b < d) {
+            return -1;
+        } else if (b > d) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+}
+
 __device__ void warp_print(const uint8_t lane_id, const uint32_t warp_id, const unsigned long long global_warp_id, const char *content) {
     if(lane_id == 0)
     {
@@ -91,10 +121,21 @@ __forceinline__ __device__ const uint32_t& get_nbr(const RelationsGPU graph, con
     return graph.nbrs_[query_edge_idx][data_vertex][nbr_idx];
 }
 
-__forceinline__ __device__ bool find_nbr(const RelationsGPU graph, const uint8_t query_edge_idx, const uint32_t data_vertex, const uint32_t nbr)
-{
-    const uint32_t res = lower_bound(graph.nbrs_[query_edge_idx][data_vertex], graph.sizes_[query_edge_idx][data_vertex], nbr);
-    if (res == graph.sizes_[query_edge_idx][data_vertex] || graph.nbrs_[query_edge_idx][data_vertex][res] != nbr){
+// __forceinline__ __device__ bool find_nbr(const RelationsGPU graph, const uint8_t query_edge_idx, const uint32_t data_vertex, const uint32_t nbr)
+// {
+//     const uint32_t res = lower_bound(graph.nbrs_[query_edge_idx][data_vertex], graph.sizes_[query_edge_idx][data_vertex], nbr);
+//     if (res == graph.sizes_[query_edge_idx][data_vertex] || graph.nbrs_[query_edge_idx][data_vertex][res] != nbr){
+//         return false;
+//     }
+//     else{
+//         return true;
+//     }
+// }
+
+__forceinline__ __device__ bool find_nbr(const RelationsGPU graph, const uint8_t query_edge_idx, 
+                                         const uint32_t data_vertex, const uint32_t nbr, uint32_t &nbr_idx) {
+    nbr_idx = lower_bound(graph.nbrs_[query_edge_idx][data_vertex], graph.sizes_[query_edge_idx][data_vertex], nbr);
+    if (nbr_idx == graph.sizes_[query_edge_idx][data_vertex] || graph.nbrs_[query_edge_idx][data_vertex][nbr_idx] != nbr){
         return false;
     }
     else{
@@ -356,20 +397,18 @@ uint32_t (*temp_result_buffer)[MAX_QV_COUNT][WARP_SIZE], uint8_t (*temp_ptr)[MAX
     // return true;
 }
 
-__global__ void gamma_enumerate(
-    const unsigned long long previous_result_ptr,
-    const unsigned long long previous_num_results,
-    const unsigned long long new_result_ptr,
-    unsigned long long *new_num_results_dptr,
-    const unsigned long long _h_max_new_num_results,
-    const RelationsGPU data_graph,
-    const uint8_t start_depth,
-    const uint8_t num_query_vertices,
-    const bool enable_work_stealing,
-    const bool enable_cartesian_product,
-    const bool write_results,
-    unsigned long long *effective_num_dptr
-) {
+__global__ void gamma_enumerate(const unsigned long long previous_result_ptr,
+                                const unsigned long long previous_num_results,
+                                const unsigned long long new_result_ptr,
+                                unsigned long long *new_num_results_dptr,
+                                const unsigned long long _h_max_new_num_results,
+                                const RelationsGPU data_graph,
+                                const uint8_t start_depth,
+                                const uint8_t num_query_vertices,
+                                const bool enable_work_stealing,
+                                const bool enable_cartesian_product,
+                                const bool write_results,
+                                unsigned long long *effective_num_dptr) {
 
     if (start_depth >= num_query_vertices) return;
 
@@ -715,6 +754,15 @@ __global__ void gamma_enumerate(
 // #endif
                         temp_nbr = get_nbr(data_graph, pre_qe_idx, pre_dv, nbr_idx);
 
+#ifdef DEDUPLICATE_RESULTS
+                        uint32_t v0 = temp_result_buffer[warp_id][0][0];
+                        uint32_t v1 = temp_result_buffer[warp_id][1][0];
+                        if (data_graph.nbrs_is_update_[pre_qe_idx][pre_dv][nbr_idx] && 
+                            compare_edges(v0, v1, pre_dv, temp_nbr) > 0) {
+                            found = false;
+                        }
+#endif
+
                      
 // #ifdef IS_DEBUGGING
 //     // if(blockIdx.x % 200 == 0 && warp_id == 0)
@@ -753,8 +801,20 @@ __global__ void gamma_enumerate(
                             const uint8_t cur_pre_dv_ptr = temp_ptr[warp_id][backward_nbr_idx];
                             const uint32_t& cur_pre_dv = temp_result_buffer[warp_id][backward_nbr_idx][cur_pre_dv_ptr];
 
-                            found = find_nbr(data_graph, cur_pre_qe_idx, cur_pre_dv, temp_nbr);
+                            uint32_t temp_nbr_idx_in_data_graph;
+                            found = find_nbr(data_graph, cur_pre_qe_idx, cur_pre_dv, temp_nbr, temp_nbr_idx_in_data_graph);
 
+#ifdef DEDUPLICATE_RESULTS
+                            if (found && data_graph.nbrs_is_update_[cur_pre_qe_idx][cur_pre_dv][temp_nbr_idx_in_data_graph]) 
+                            {
+                                uint32_t v0 = temp_result_buffer[warp_id][0][0];
+                                uint32_t v1 = temp_result_buffer[warp_id][1][0];
+                                if (compare_edges(v0, v1, cur_pre_dv, temp_nbr) > 0) 
+                                {
+                                    found = false;
+                                }
+                            }
+#endif
                             if(found == false) break;
                         }
                     }
@@ -930,16 +990,15 @@ __device__ __forceinline__ unsigned long long calculate_result_write_start_point
 }  // namespace
 
 
-__global__ void gammaEnumerateCartesianProductTree(
-        const unsigned long long res,
-        const unsigned long long res_size,
-        const unsigned long *max_num_matches_prefix_sum,
-        const unsigned long *max_num_total_matches,
-        const RelationsGPU index,
-        const uint8_t num_query_vertices,
-        unsigned long long *new_res_size,
-        unsigned long long *effective_num_dptr,
-        const bool write_results) {
+__global__ void gammaEnumerateCartesianProductTree(const unsigned long long res,
+                                                   const unsigned long long res_size,
+                                                   const unsigned long *max_num_matches_prefix_sum,
+                                                   const unsigned long *max_num_total_matches,
+                                                   const RelationsGPU index,
+                                                   const uint8_t num_query_vertices,
+                                                   unsigned long long *new_res_size,
+                                                   unsigned long long *effective_num_dptr,
+                                                   const bool write_results) {
     const unsigned long long new_result_ptr = calculate_result_write_start_pointer(res, res_size, num_query_vertices);
     __shared__ uint32_t visited[NUM_WARP_PER_BLOCK][WARP_SIZE][MAX_QV_COUNT - 1];
 
@@ -995,10 +1054,11 @@ __global__ void gammaEnumerateCartesianProductTree(
             {
                 const uint8_t& pre_qv_idx = get_first_backward_neighbor_idx(cur_order, j);
                 const uint8_t& pre_qe_idx = get_query_edge_idx(cur_order.vs_[pre_qv_idx], cur_order.vs_[j]);
-                const uint32_t v = gamma_get_previous_result(cur_order, res, res_index, num_query_vertices, pre_qv_idx);
+                const uint32_t pre_dv = gamma_get_previous_result(cur_order, res, res_index, num_query_vertices, pre_qv_idx);
 
-                map_v = index.nbrs_[pre_qe_idx][v][res_index_index % index.sizes_[pre_qe_idx][v]];
-                res_index_index /= index.sizes_[pre_qe_idx][v];
+                uint32_t map_v_idx_in_index = res_index_index % index.sizes_[pre_qe_idx][pre_dv];
+                map_v = index.nbrs_[pre_qe_idx][pre_dv][map_v_idx_in_index];
+                res_index_index /= index.sizes_[pre_qe_idx][pre_dv];
 
                 for (uint8_t k = 0u; k < j; k++)
                 {
@@ -1008,6 +1068,17 @@ __global__ void gammaEnumerateCartesianProductTree(
                         break;
                     }
                 }
+#ifdef DEDUPLICATE_RESULTS                
+                if (found && index.nbrs_is_update_[pre_qe_idx][pre_dv][map_v_idx_in_index]) 
+                {
+                    uint32_t v0 = visited[warp_id][lane_id][0];
+                    uint32_t v1 = visited[warp_id][lane_id][1];
+                    if (compare_edges(v0, v1, pre_dv, map_v) > 0) 
+                    {
+                        found = false;
+                    }
+                }
+#endif
                 if (!found) break;
                 if (j != num_query_vertices - 1) visited[warp_id][lane_id][j] = map_v;
             }
